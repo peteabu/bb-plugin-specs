@@ -113,6 +113,8 @@ export type SpecDetail = {
   annotations: Annotation[];
   links: Array<{ projectId: string; mode: LinkMode }>;
   chatThreadId: string | null;
+  textQuestions: Array<{ text: string; source: "section" | "marker" }>;
+  textDecisions: string[];
 };
 export type ThreadSpecsResult = {
   specs: ThreadSpecLink[];
@@ -139,6 +141,13 @@ export const rpcContract = defineRpcContract({
       annotations: z.array(annotationSchema),
       links: z.array(z.object({ projectId: z.string(), mode: linkModeSchema })),
       chatThreadId: z.string().nullable(),
+      textQuestions: z.array(
+        z.object({
+          text: z.string(),
+          source: z.enum(["section", "marker"]),
+        }),
+      ),
+      textDecisions: z.array(z.string()),
     }),
   },
   specs_create: {
@@ -227,6 +236,16 @@ export const rpcContract = defineRpcContract({
   questions_reopen: {
     input: z.object({ annotationId: z.string() }),
     output: z.object({ ok: z.literal(true) }),
+  },
+  questions_promote: {
+    input: z.object({
+      specId: z.string(),
+      text: z.string().trim().min(1).max(2000),
+    }),
+    output: z.object({
+      annotationId: z.string(),
+      revision: z.number().int(),
+    }),
   },
   annotations_comment: {
     input: z.object({
@@ -390,6 +409,75 @@ function assertContentSize(content: string): void {
       `Spec content is ${content.length} characters; the limit is ${MAX_CONTENT_CHARS}.`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// Prose questions and decisions
+//
+// Questions can be posed in the text itself instead of as annotations. The
+// convention is a `## Open questions` (or `## Decisions`) section whose list
+// items are the questions, plus inline `TBD:` / `TODO(question):` markers.
+// Promoted items carry a `→ ann_...` reference and stop being detected.
+// ---------------------------------------------------------------------------
+
+interface TextQuestion {
+  text: string;
+  source: "section" | "marker";
+}
+
+const PROMOTED_REFERENCE = /→\s*ann_[0-9a-z]+/iu;
+
+function isPromotedText(text: string): boolean {
+  return PROMOTED_REFERENCE.test(text);
+}
+
+function sectionItems(
+  content: string,
+  headingPattern: RegExp,
+): Array<{ text: string; line: number }> {
+  const lines = content.split("\n");
+  const items: Array<{ text: string; line: number }> = [];
+  let inSection = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = (lines[index] ?? "").trim();
+    const heading = /^#{1,6}\s+(.*)$/u.exec(line);
+    if (heading !== null) {
+      inSection = headingPattern.test((heading[1] ?? "").trim());
+      continue;
+    }
+    if (!inSection) continue;
+    const item = /^(?:[-*+]|\d+[.)])\s+(.*)$/u.exec(line);
+    if (item === null) continue;
+    const text = (item[1] ?? "").trim();
+    if (text === "" || isPromotedText(text)) continue;
+    items.push({ text, line: index });
+  }
+  return items;
+}
+
+function detectTextQuestions(content: string): TextQuestion[] {
+  const found: TextQuestion[] = sectionItems(
+    content,
+    /^(?:open\s+)?questions?$/iu,
+  ).map((item) => ({ text: item.text, source: "section" as const }));
+  const lines = content.split("\n");
+  for (const raw of lines) {
+    const marker =
+      /^(?:[-*+]\s+)?(?:TBD|TODO\(question\)|OPEN QUESTION)\s*:\s*(.+)$/iu.exec(
+        raw.trim(),
+      );
+    if (marker === null) continue;
+    const text = (marker[1] ?? "").trim();
+    if (text === "" || isPromotedText(text)) continue;
+    found.push({ text, source: "marker" });
+  }
+  return found.slice(0, 20);
+}
+
+function detectTextDecisions(content: string): string[] {
+  return sectionItems(content, /^decisions?(?:\s+log)?$/iu)
+    .map((item) => item.text)
+    .slice(0, 20);
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1225,93 @@ export default async function plugin(bb: BbPluginApi) {
     return { archivedThreadId: chat?.thread_id ?? null };
   }
 
+  // ---- prose question scan (cached per revision) ---------------------------
+
+  const textScanCache = new Map<
+    string,
+    { revision: number; questions: TextQuestion[]; decisions: string[] }
+  >();
+
+  function scanSpecText(spec: SpecRecord): {
+    questions: TextQuestion[];
+    decisions: string[];
+  } {
+    const cached = textScanCache.get(spec.id);
+    if (cached !== undefined && cached.revision === spec.revision) {
+      return { questions: cached.questions, decisions: cached.decisions };
+    }
+    const questions = detectTextQuestions(spec.content);
+    const decisions = detectTextDecisions(spec.content);
+    if (textScanCache.size > 300) textScanCache.clear();
+    textScanCache.set(spec.id, {
+      revision: spec.revision,
+      questions,
+      decisions,
+    });
+    return { questions, decisions };
+  }
+
+  function collectTextQuestions(options: {
+    specId?: string;
+    projectId?: string | null;
+    limit?: number;
+  }): Array<{ spec: SpecRecord; text: string; source: TextQuestion["source"] }> {
+    const specs =
+      options.specId !== undefined
+        ? [findSpecById(options.specId)].filter(
+            (spec): spec is SpecRecord => spec !== undefined,
+          )
+        : listSpecs({
+            projectId: options.projectId ?? null,
+            limit: options.limit ?? 50,
+          });
+    const found: Array<{
+      spec: SpecRecord;
+      text: string;
+      source: TextQuestion["source"];
+    }> = [];
+    for (const spec of specs) {
+      if (spec.content.length > 60_000) continue;
+      for (const question of scanSpecText(spec).questions) {
+        found.push({ spec, text: question.text, source: question.source });
+      }
+    }
+    return found;
+  }
+
+  function promoteTextQuestion(
+    specId: string,
+    text: string,
+    actor: string,
+  ): { annotationId: string; revision: number } {
+    const spec = findSpecById(specId);
+    if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
+    const needle = text.trim();
+    if (needle === "" || !spec.content.includes(needle)) {
+      throw new Error(
+        "That text is no longer in the spec; re-read it and promote the current wording.",
+      );
+    }
+    const created = createAnnotation({
+      specId,
+      quote: needle,
+      body: needle,
+      author: actor,
+      kind: "question",
+    });
+    saveSpec({
+      id: specId,
+      content: spec.content.replace(needle, `${needle} → ${created.id}`),
+      expectedRevision: spec.revision,
+      author: actor,
+    });
+    const updated = findSpecById(specId);
+    return {
+      annotationId: created.id,
+      revision: updated?.revision ?? spec.revision + 1,
+    };
+  }
+
   // ---- context digest ------------------------------------------------------
 
   interface DigestEntry {
@@ -1276,12 +1451,18 @@ export default async function plugin(bb: BbPluginApi) {
       .all(projectId) as Array<{ state: string; n: number }>;
     const countState = (state: string): number =>
       questionCounts.find((row) => row.state === state)?.n ?? 0;
+    const textQuestionCount = collectTextQuestions({
+      projectId,
+      limit: 50,
+    }).length;
+    const openTotal =
+      countState("open") + countState("answered") + countState("clarify");
     const questionLine =
-      countState("open") + countState("answered") + countState("clarify") === 0
+      openTotal + textQuestionCount === 0
         ? ""
         : [
-            `Open questions: ${countState("open")} open · ${countState("answered")} awaiting triage · ${countState("clarify")} in clarification.`,
-            `List with specs_questions({ projectId }); close with specs_answer, specs_clarify, specs_resolve, or specs_dismiss.`,
+            `Open questions: ${countState("open")} open · ${countState("answered")} awaiting triage · ${countState("clarify")} in clarification${textQuestionCount === 0 ? "" : ` · ${textQuestionCount} in text`}.`,
+            `List with specs_questions({ projectId }); promote text questions with specs_promote; close with specs_answer, specs_clarify, specs_resolve, or specs_dismiss.`,
           ].join(" ");
     return `${[header, ...lines].join("\n")}\n${trailer}${questionLine === "" ? "" : `\n${questionLine}`}`;
   }
@@ -1476,6 +1657,21 @@ export default async function plugin(bb: BbPluginApi) {
           parts.push(
             `- ${decision.id} "${truncate(decision.quote, 120)}" — ${truncate(decision.decision, 240)} (${decision.resolvedBy}, ${relativeTime(decision.resolvedAt ?? decision.updatedAt)}${decision.foldedRevision === null ? "" : `, folded into v${decision.foldedRevision}`})`,
           );
+        }
+      }
+      const scan = scanSpecText(spec);
+      if (scan.questions.length > 0) {
+        parts.push("", "## Text questions (not yet in the loop)");
+        for (const question of scan.questions) {
+          parts.push(
+            `- ${question.text} (${question.source}) — promote with specs_promote`,
+          );
+        }
+      }
+      if (scan.decisions.length > 0) {
+        parts.push("", "## Decisions in text (not audited)");
+        for (const decision of scan.decisions) {
+          parts.push(`- ${decision}`);
         }
       }
     }
@@ -1697,8 +1893,61 @@ export default async function plugin(bb: BbPluginApi) {
           ...(state === undefined ? {} : { state }),
           ...(limit === undefined ? {} : { limit }),
         });
-        if (rows.length === 0) return toolText("No questions match.");
-        return toolText(rows.map((row) => formatQuestionLine(toQuestionLine(row))).join("\n"));
+        const textQuestions = collectTextQuestions({
+          ...(specId === undefined ? {} : { specId }),
+          projectId: projectId ?? null,
+          limit,
+        });
+        const sections: string[] = [];
+        if (rows.length > 0) {
+          sections.push(
+            rows.map((row) => formatQuestionLine(toQuestionLine(row))).join("\n"),
+          );
+        }
+        if (textQuestions.length > 0) {
+          sections.push(
+            [
+              "Questions in text (not yet in the loop):",
+              ...textQuestions.map(
+                (entry) =>
+                  `- [${entry.spec.slug}] ${truncate(entry.text, 180)} (${entry.source}) — promote with specs_promote`,
+              ),
+            ].join("\n"),
+          );
+        }
+        if (sections.length === 0) return toolText("No questions match.");
+        return toolText(sections.join("\n\n"));
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_promote",
+    description:
+      "Promote a question written in the spec text (an item of a `## Open questions` section, or a `TBD:` / `TODO(question):` marker) into the question loop. Creates an anchored question and replaces the prose with a reference to it.",
+    instructions:
+      "When a spec's text poses questions, promote them with specs_promote before answering so the answer and decision are audited.",
+    presentation: {
+      label: { pending: "Promoting question", completed: "Promoted question" },
+      icon: { glyph: "Target" },
+    },
+    parameters: z.object({
+      idOrSlug: z.string().min(1),
+      text: z
+        .string()
+        .min(1)
+        .max(2000)
+        .describe("Exact text of the question as written in the spec."),
+    }),
+    execute: ({ idOrSlug, text }) => {
+      try {
+        const spec = mustFindSpec(idOrSlug);
+        const result = promoteTextQuestion(spec.id, text, "agent");
+        return toolText(
+          `Promoted to ${result.annotationId}; the spec is now at revision ${result.revision}.`,
+        );
       } catch (error) {
         return toolError(error instanceof Error ? error.message : String(error));
       }
@@ -1892,6 +2141,7 @@ export default async function plugin(bb: BbPluginApi) {
     "specs_clarify",
     "specs_resolve",
     "specs_dismiss",
+    "specs_promote",
     "specs_attach",
     "specs_detach",
     "specs_delete",
@@ -1969,6 +2219,7 @@ export default async function plugin(bb: BbPluginApi) {
         .prepare("SELECT thread_id FROM chat_threads WHERE spec_id = ?")
         .get(spec.id) as { thread_id: string } | undefined;
       const projectId = links[0]?.projectId;
+      const scan = scanSpecText(spec);
       return {
         spec: {
           ...specSummary(spec),
@@ -1979,6 +2230,11 @@ export default async function plugin(bb: BbPluginApi) {
         annotations: annotationsFor(spec.id),
         links,
         chatThreadId: chat?.thread_id ?? null,
+        textQuestions: scan.questions.map((question) => ({
+          text: question.text,
+          source: question.source,
+        })),
+        textDecisions: scan.decisions,
       };
     },
 
@@ -2103,6 +2359,10 @@ export default async function plugin(bb: BbPluginApi) {
     questions_reopen: ({ annotationId }) => {
       reopenQuestion(annotationId, "user");
       return { ok: true as const };
+    },
+
+    questions_promote: ({ specId, text }) => {
+      return promoteTextQuestion(specId, text, "user");
     },
 
     annotations_comment: ({ annotationId, body }) => {
@@ -2299,6 +2559,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb specs unlink <id-or-slug> --project <id> [--json]",
     "  bb specs annotate <id-or-slug> --quote <text> --body <text> [--kind note|question] [--json]",
     "  bb specs questions [<id-or-slug>] [--state open|answered|clarify|resolved|dismissed|all] [--project <id>] [--json]",
+    "  bb specs promote <id-or-slug> <question text as written> [--json]",
     "  bb specs answer <annotation-id> --text <answer> [--json]",
     "  bb specs clarify <annotation-id> <follow-up question> [--json]",
     "  bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]",
@@ -2330,6 +2591,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "unlink", summary: "Unlink a spec from a project", usage: "bb specs unlink <id-or-slug> --project <id> [--json]" },
       { name: "annotate", summary: "Annotate a spec with a note or question", usage: "bb specs annotate <id-or-slug> --quote <text> --body <text> [--kind note|question] [--json]" },
       { name: "questions", summary: "List questions and their loop state", usage: "bb specs questions [<id-or-slug>] [--state <state>] [--project <id>] [--json]" },
+      { name: "promote", summary: "Promote a question written in the spec text", usage: "bb specs promote <id-or-slug> <question text as written> [--json]" },
       { name: "answer", summary: "Answer a question for triage", usage: "bb specs answer <annotation-id> --text <answer> [--json]" },
       { name: "clarify", summary: "Ask a follow-up question", usage: "bb specs clarify <annotation-id> <follow-up question> [--json]" },
       { name: "resolve-question", summary: "Close a question with a decision", usage: "bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]" },
@@ -2551,10 +2813,49 @@ export default async function plugin(bb: BbPluginApi) {
               projectId: flagString("project") ?? null,
               state,
             });
-            if (json) return reply(rows, "");
+            const textQuestions = collectTextQuestions({
+              ...(specId === undefined ? {} : { specId }),
+              projectId: flagString("project") ?? null,
+            });
+            const textSection = [
+              "Questions in text (not yet in the loop):",
+              ...textQuestions.map(
+                (entry) =>
+                  `- [${entry.spec.slug}] ${truncate(entry.text, 180)} (${entry.source})`,
+              ),
+            ].join("\n");
+            if (json) {
+              return reply(
+                {
+                  questions: rows,
+                  text: textQuestions.map((entry) => ({
+                    spec: entry.spec.slug,
+                    text: entry.text,
+                    source: entry.source,
+                  })),
+                },
+                "",
+              );
+            }
+            const lines = rows.map((row) =>
+              formatQuestionLine(toQuestionLine(row)),
+            );
+            if (textQuestions.length > 0) lines.push("", textSection);
             return reply(
               rows,
-              rows.length === 0 ? "No questions." : rows.map((row) => formatQuestionLine(toQuestionLine(row))).join("\n"),
+              lines.length === 0 ? "No questions." : lines.join("\n"),
+            );
+          }
+
+          case "promote": {
+            const idOrSlug = rest[0];
+            const text = rest.slice(1).join(" ").trim();
+            if (idOrSlug === undefined || text === "") return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const result = promoteTextQuestion(spec.id, text, "cli");
+            return reply(
+              { ok: true, ...result },
+              `Promoted to ${result.annotationId}; spec is now at revision ${result.revision}.`,
             );
           }
 

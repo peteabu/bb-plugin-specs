@@ -31,6 +31,7 @@ in the injected context; full content is pulled on demand.
 | `specs_clarify` | Ask a follow-up when an answer is not enough to decide. |
 | `specs_resolve` | Close a question with a decision, linked to the spec revision that carries it. |
 | `specs_dismiss` | Drop a question without deciding (out of scope, duplicate). |
+| `specs_promote` | Turn a question written in the spec text into a loop question (see below). |
 | `specs_attach` / `specs_detach` | Add or remove a spec from this thread's context. |
 | `specs_delete` | Permanently delete a spec, its revisions, and its annotations. Its chat thread is archived. Only on explicit request. |
 
@@ -61,6 +62,28 @@ folded decision. `specs_read` returns open questions and the decision audit
 trail, so a later thread can see why the spec says what it says. Never edit a
 decided question's decision into silence — reopen it (`specs_reopen`) or open a
 new question that references it.
+
+## Questions written in the text
+
+Questions can also be posed in the document itself. The plugin detects:
+
+- list items under a `## Open questions` (or `## Questions`) heading
+- inline `TBD:`, `TODO(question):`, and `OPEN QUESTION:` markers
+
+They show up in `specs_questions` as "Questions in text (not yet in the loop)",
+in the digest as an `in text` count, and in the comments rail under **From
+text**. A question already carrying a `→ ann_...` reference is treated as
+promoted and is not detected again.
+
+**Promote before answering.** `specs_promote({ idOrSlug, text })` creates a real
+loop question anchored to that line and replaces the prose with
+`<question> → ann_...`, so the answer, decision, and audit trail attach to it
+instead of living in prose. Use the exact wording from the spec; if the text
+changed, re-read first.
+
+Decisions written under a `## Decisions` heading are listed read-only in the
+History view. Record new decisions through `specs_resolve` — prose decisions
+are labelled "not audited".
 
 ## Conventions
 

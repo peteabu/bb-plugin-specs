@@ -1168,6 +1168,8 @@ function CommentCard({
 
 function CommentsRail({
   annotations,
+  textQuestions,
+  textDecisions,
   onClose,
   onReply,
   onStatus,
@@ -1178,8 +1180,11 @@ function CommentsRail({
   onResolve,
   onDismiss,
   onReopen,
+  onPromote,
 }: {
   annotations: Annotation[];
+  textQuestions: Array<{ text: string; source: "section" | "marker" }>;
+  textDecisions: string[];
   onClose: () => void;
   onReply: (annotationId: string, body: string) => Promise<void>;
   onStatus: (annotationId: string, status: "open" | "resolved") => Promise<void>;
@@ -1190,8 +1195,10 @@ function CommentsRail({
   onResolve: (annotationId: string, decision: string) => Promise<void>;
   onDismiss: (annotationId: string, reason: string) => Promise<void>;
   onReopen: (annotationId: string) => Promise<void>;
+  onPromote: (text: string) => Promise<void>;
 }) {
   const [filter, setFilter] = useState<"open" | "answered" | "history">("open");
+  const [promoting, setPromoting] = useState<string | null>(null);
   const openItems = annotations.filter((annotation) => annotation.status === "open");
   const answeredItems = annotations.filter(
     (annotation) => annotation.kind === "question" && annotation.state === "answered",
@@ -1240,7 +1247,49 @@ function CommentsRail({
         </IconButton>
       </div>
       <div className="specs-scroll min-h-0 flex-1 space-y-2.5 overflow-y-auto p-3">
-        {shown.length === 0 ? (
+        {filter === "open" && textQuestions.length > 0 ? (
+          <div className="specs-hairline rounded-xl bg-card p-3">
+            <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              From text ({textQuestions.length})
+            </p>
+            <ul className="mt-1.5 space-y-2.5">
+              {textQuestions.map((question) => (
+                <li key={question.text} className="flex items-start gap-2">
+                  <span className="min-w-0 flex-1 text-sm leading-relaxed text-foreground/90">
+                    {question.text}
+                    <span className="ml-1.5 text-[10px] text-muted-foreground">
+                      {question.source === "marker"
+                        ? "TBD marker"
+                        : "Open questions section"}
+                    </span>
+                  </span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 shrink-0 px-2.5"
+                    disabled={promoting === question.text}
+                    onClick={() => {
+                      setPromoting(question.text);
+                      void onPromote(question.text).finally(() =>
+                        setPromoting(null),
+                      );
+                    }}
+                  >
+                    {promoting === question.text ? "Promoting…" : "Promote"}
+                  </Button>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-2 text-[10px] text-muted-foreground">
+              Promoting moves the question into the loop and replaces the prose
+              with a reference.
+            </p>
+          </div>
+        ) : null}
+
+        {shown.length === 0 &&
+        !(filter === "open" && textQuestions.length > 0) &&
+        !(filter === "history" && textDecisions.length > 0) ? (
           <div className="pt-6">
             <EmptyState>
               {filter === "open"
@@ -1267,6 +1316,27 @@ function CommentsRail({
             />
           ))
         )}
+
+        {filter === "history" && textDecisions.length > 0 ? (
+          <div className="specs-hairline rounded-xl bg-card p-3">
+            <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Decisions in text ({textDecisions.length})
+            </p>
+            <ul className="mt-1.5 space-y-1.5">
+              {textDecisions.map((decision) => (
+                <li
+                  key={decision}
+                  className="text-sm leading-relaxed text-foreground/90"
+                >
+                  {decision}
+                  <span className="ml-1.5 text-[10px] text-muted-foreground">
+                    not audited
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
       </div>
     </>
   );
@@ -2014,6 +2084,8 @@ function SpecsPage({ subPath }: { subPath: string }) {
           {rail === "comments" ? (
             <CommentsRail
               annotations={detail.annotations}
+              textQuestions={detail.textQuestions}
+              textDecisions={detail.textDecisions}
               onClose={() => setRailAndNavigate("none")}
               onReply={async (annotationId, body) => {
                 try {
@@ -2081,6 +2153,19 @@ function SpecsPage({ subPath }: { subPath: string }) {
                 try {
                   await rpc.call("questions_reopen", { annotationId });
                   refetchDetail(selectedSlug);
+                } catch (cause) {
+                  toast.error(messageOf(cause));
+                }
+              }}
+              onPromote={async (text) => {
+                try {
+                  const result = await rpc.call("questions_promote", {
+                    specId: detail.spec.id,
+                    text,
+                  });
+                  toast.success(`Promoted to ${result.annotationId}`);
+                  refetchDetail(selectedSlug);
+                  refetchList();
                 } catch (cause) {
                   toast.error(messageOf(cause));
                 }
