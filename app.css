@@ -1,0 +1,310 @@
+/* Specs — Notion/Craft-flavored document surfaces built on BB theme tokens. */
+
+.specs-root {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  --specs-hairline:
+    0 0 0 1px rgba(0, 0, 0, 0.055),
+    0 1px 2px -1px rgba(0, 0, 0, 0.05),
+    0 2px 6px rgba(0, 0, 0, 0.035);
+  --specs-hairline-strong:
+    0 0 0 1px rgba(0, 0, 0, 0.08),
+    0 2px 4px -1px rgba(0, 0, 0, 0.07),
+    0 6px 16px rgba(0, 0, 0, 0.06);
+  --specs-pop:
+    0 0 0 1px rgba(0, 0, 0, 0.06),
+    0 8px 24px rgba(0, 0, 0, 0.12),
+    0 2px 6px rgba(0, 0, 0, 0.06);
+}
+
+.dark .specs-root {
+  --specs-hairline: 0 0 0 1px rgba(255, 255, 255, 0.08);
+  --specs-hairline-strong: 0 0 0 1px rgba(255, 255, 255, 0.14);
+  --specs-pop:
+    0 0 0 1px rgba(255, 255, 255, 0.1),
+    0 12px 32px rgba(0, 0, 0, 0.5);
+}
+
+.specs-hairline {
+  box-shadow: var(--specs-hairline);
+}
+
+.specs-hairline-strong {
+  box-shadow: var(--specs-hairline-strong);
+}
+
+.specs-pop {
+  box-shadow: var(--specs-pop);
+}
+
+.specs-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--muted-foreground) 30%, transparent)
+    transparent;
+}
+
+.specs-press {
+  transition-property:
+    scale, background-color, color, border-color, box-shadow, opacity;
+  transition-duration: 150ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+.specs-press:active:not(:disabled) {
+  scale: 0.96;
+}
+
+.specs-row {
+  transition-property: background-color, color, opacity;
+  transition-duration: 120ms;
+  transition-timing-function: cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* --- document typography -------------------------------------------------- */
+
+.specs-doc {
+  font-size: 1rem;
+  line-height: 1.75;
+  color: var(--foreground);
+}
+
+.specs-doc > :first-child {
+  margin-top: 0;
+}
+
+.specs-doc h1 {
+  font-size: 1.75rem;
+  line-height: 1.25;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+  margin: 2.25rem 0 0.75rem;
+  text-wrap: balance;
+}
+
+.specs-doc h2 {
+  font-size: 1.3125rem;
+  line-height: 1.35;
+  font-weight: 640;
+  letter-spacing: -0.015em;
+  margin: 2rem 0 0.5rem;
+  text-wrap: balance;
+}
+
+.specs-doc h3 {
+  font-size: 1.125rem;
+  line-height: 1.4;
+  font-weight: 620;
+  margin: 1.75rem 0 0.375rem;
+}
+
+.specs-doc h4 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 1.5rem 0 0.25rem;
+}
+
+.specs-doc p {
+  margin: 0.75rem 0;
+  text-wrap: pretty;
+}
+
+.specs-doc ul,
+.specs-doc ol {
+  margin: 0.75rem 0;
+  padding-left: 1.5rem;
+}
+
+.specs-doc ul {
+  list-style: disc;
+}
+
+.specs-doc ol {
+  list-style: decimal;
+}
+
+.specs-doc li {
+  margin: 0.3rem 0;
+}
+
+.specs-doc li::marker {
+  color: color-mix(in oklab, var(--muted-foreground) 85%, transparent);
+}
+
+.specs-doc code {
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 0.875em;
+  background-color: var(--secondary);
+  border-radius: 0.375rem;
+  padding: 0.125rem 0.375rem;
+}
+
+.specs-doc pre {
+  background-color: var(--secondary);
+  border-radius: 0.75rem;
+  padding: 1rem 1.125rem;
+  margin: 1.25rem 0;
+  overflow-x: auto;
+}
+
+.specs-doc pre code {
+  background-color: transparent;
+  padding: 0;
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.specs-doc blockquote {
+  border-left: 3px solid color-mix(in oklab, var(--primary) 45%, transparent);
+  padding-left: 1rem;
+  margin: 1.25rem 0;
+  color: var(--muted-foreground);
+}
+
+.specs-doc a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.specs-doc hr {
+  border-color: var(--border);
+  margin: 2rem 0;
+}
+
+.specs-doc img {
+  outline: 1px solid rgba(0, 0, 0, 0.1);
+  outline-offset: -1px;
+  border-radius: 0.75rem;
+}
+
+.dark .specs-doc img {
+  outline-color: rgba(255, 255, 255, 0.1);
+}
+
+.specs-doc table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.25rem 0;
+  font-size: 0.9375rem;
+}
+
+.specs-doc th,
+.specs-doc td {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+}
+
+.specs-doc th {
+  background-color: var(--secondary);
+  font-weight: 600;
+}
+
+.specs-doc ::selection,
+.specs-editor ::selection {
+  background-color: color-mix(in oklab, var(--primary) 22%, transparent);
+}
+
+.specs-editor {
+  font-size: 1rem;
+  line-height: 1.75;
+  color: var(--foreground);
+  background-color: transparent;
+  outline: none;
+  resize: none;
+  field-sizing: content;
+}
+
+.specs-editor::placeholder {
+  color: color-mix(in oklab, var(--muted-foreground) 55%, transparent);
+}
+
+/* --- floating pieces ------------------------------------------------------ */
+
+.specs-toolbar {
+  position: fixed;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 12px;
+  background-color: var(--popover, var(--card));
+  box-shadow: var(--specs-pop);
+  transform: translateX(-50%);
+  animation: specs-pop-in 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.specs-popover {
+  position: fixed;
+  z-index: 70;
+  width: 340px;
+  border-radius: 16px;
+  background-color: var(--popover, var(--card));
+  box-shadow: var(--specs-pop);
+  transform: translateX(-50%);
+  animation: specs-pop-in 160ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.specs-rail {
+  animation: specs-rail-in 180ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.specs-property-popover {
+  position: absolute;
+  z-index: 50;
+  border-radius: 0.75rem;
+  background-color: var(--popover, var(--card));
+  box-shadow: var(--specs-pop);
+  animation: specs-menu-in 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+@keyframes specs-menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes specs-pop-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(4px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0) scale(1);
+  }
+}
+
+@keyframes specs-rail-in {
+  from {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* --- annotation anchoring ------------------------------------------------- */
+
+::highlight(specs-annotation) {
+  background-color: color-mix(in oklab, var(--primary) 22%, transparent);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--primary) 65%, transparent);
+  text-underline-offset: 2px;
+}
+
+mark.specs-annotation-mark {
+  background-color: color-mix(in oklab, var(--primary) 22%, transparent);
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--primary) 65%, transparent);
+  text-underline-offset: 2px;
+}
