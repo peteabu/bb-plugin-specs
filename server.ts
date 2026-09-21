@@ -45,6 +45,16 @@ const commentSchema = z.object({
 });
 export type AnnotationComment = z.infer<typeof commentSchema>;
 
+const questionEventSchema = z.object({
+  id: z.string(),
+  event: z.enum(["asked", "answered", "clarified", "resolved", "dismissed", "reopened"]),
+  actor: z.string(),
+  note: z.string(),
+  revision: z.number().int().nullable(),
+  createdAt: z.string(),
+});
+export type QuestionEvent = z.infer<typeof questionEventSchema>;
+
 const annotationSchema = z.object({
   id: z.string(),
   specId: z.string(),
@@ -54,9 +64,20 @@ const annotationSchema = z.object({
   body: z.string(),
   author: z.string(),
   status: z.enum(["open", "resolved"]),
+  kind: z.enum(["note", "question"]),
+  state: z.enum(["open", "answered", "clarify", "resolved", "dismissed"]),
+  answer: z.string(),
+  answeredBy: z.string(),
+  answeredAt: z.string().nullable(),
+  parentId: z.string().nullable(),
+  decision: z.string(),
+  foldedRevision: z.number().int().nullable(),
+  resolvedBy: z.string(),
+  resolvedAt: z.string().nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
   comments: z.array(commentSchema),
+  events: z.array(questionEventSchema),
 });
 export type Annotation = z.infer<typeof annotationSchema>;
 
@@ -170,8 +191,42 @@ export const rpcContract = defineRpcContract({
       prefix: z.string().max(500).optional(),
       suffix: z.string().max(500).optional(),
       body: z.string().trim().min(1).max(5000),
+      kind: z.enum(["note", "question"]).optional(),
     }),
     output: z.object({ id: z.string() }),
+  },
+  questions_answer: {
+    input: z.object({
+      annotationId: z.string(),
+      answer: z.string().trim().min(1).max(5000),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  questions_clarify: {
+    input: z.object({
+      annotationId: z.string(),
+      question: z.string().trim().min(1).max(5000),
+    }),
+    output: z.object({ childId: z.string() }),
+  },
+  questions_resolve: {
+    input: z.object({
+      annotationId: z.string(),
+      decision: z.string().trim().min(1).max(5000),
+      foldedRevision: z.number().int().optional(),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  questions_dismiss: {
+    input: z.object({
+      annotationId: z.string(),
+      reason: z.string().max(5000).optional(),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  questions_reopen: {
+    input: z.object({ annotationId: z.string() }),
+    output: z.object({ ok: z.literal(true) }),
   },
   annotations_comment: {
     input: z.object({
@@ -239,8 +294,29 @@ interface AnnotationRecord {
   body: string;
   author: string;
   status: "open" | "resolved";
+  kind: "note" | "question";
+  state: "open" | "answered" | "clarify" | "resolved" | "dismissed";
+  answer: string;
+  answered_by: string;
+  answered_at: string | null;
+  parent_id: string | null;
+  decision: string;
+  folded_revision: number | null;
+  resolved_by: string;
+  resolved_at: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface QuestionEventRecord {
+  id: string;
+  question_id: string;
+  spec_id: string;
+  event: "asked" | "answered" | "clarified" | "resolved" | "dismissed" | "reopened";
+  actor: string;
+  note: string;
+  revision: number | null;
+  created_at: string;
 }
 
 interface CommentRecord {
@@ -425,6 +501,27 @@ export default async function plugin(bb: BbPluginApi) {
       PRIMARY KEY (spec_id, revision)
     )`,
     `ALTER TABLE specs ADD COLUMN icon TEXT NOT NULL DEFAULT '📄'`,
+    `ALTER TABLE annotations ADD COLUMN kind TEXT NOT NULL DEFAULT 'note'`,
+    `ALTER TABLE annotations ADD COLUMN state TEXT NOT NULL DEFAULT 'open'`,
+    `ALTER TABLE annotations ADD COLUMN answer TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE annotations ADD COLUMN answered_by TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE annotations ADD COLUMN answered_at TEXT`,
+    `ALTER TABLE annotations ADD COLUMN parent_id TEXT`,
+    `ALTER TABLE annotations ADD COLUMN decision TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE annotations ADD COLUMN folded_revision INTEGER`,
+    `ALTER TABLE annotations ADD COLUMN resolved_by TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE annotations ADD COLUMN resolved_at TEXT`,
+    `CREATE TABLE IF NOT EXISTS question_events (
+      id TEXT PRIMARY KEY,
+      question_id TEXT NOT NULL,
+      spec_id TEXT NOT NULL,
+      event TEXT NOT NULL,
+      actor TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+      revision INTEGER,
+      created_at TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS question_events_spec_idx ON question_events(spec_id)`,
   ]);
 
   // ---- project name cache (sync digest needs names without async sdk calls) --
@@ -552,6 +649,22 @@ export default async function plugin(bb: BbPluginApi) {
       .all(...params, limit) as SpecRecord[];
   }
 
+  function eventsFor(annotationId: string): Array<z.infer<typeof questionEventSchema>> {
+    const rows = db
+      .prepare(
+        "SELECT * FROM question_events WHERE question_id = ? ORDER BY created_at ASC",
+      )
+      .all(annotationId) as QuestionEventRecord[];
+    return rows.map((row) => ({
+      id: row.id,
+      event: row.event,
+      actor: row.actor,
+      note: row.note,
+      revision: row.revision,
+      createdAt: row.created_at,
+    }));
+  }
+
   function annotationsFor(specId: string): Annotation[] {
     const rows = db
       .prepare(
@@ -585,10 +698,189 @@ export default async function plugin(bb: BbPluginApi) {
       body: row.body,
       author: row.author,
       status: row.status,
+      kind: row.kind,
+      state: row.state,
+      answer: row.answer,
+      answeredBy: row.answered_by,
+      answeredAt: row.answered_at,
+      parentId: row.parent_id,
+      decision: row.decision,
+      foldedRevision: row.folded_revision,
+      resolvedBy: row.resolved_by,
+      resolvedAt: row.resolved_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       comments: byAnnotation.get(row.id) ?? [],
+      events: row.kind === "question" ? eventsFor(row.id) : [],
     }));
+  }
+
+  function recordQuestionEvent(
+    questionId: string,
+    specId: string,
+    event: QuestionEventRecord["event"],
+    actor: string,
+    note = "",
+    revision: number | null = null,
+  ): void {
+    db.prepare(
+      `INSERT INTO question_events (id, question_id, spec_id, event, actor, note, revision, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      `evt_${randomUUID().slice(0, 8)}`,
+      questionId,
+      specId,
+      event,
+      actor,
+      note,
+      revision,
+      nowIso(),
+    );
+  }
+
+  function createAnnotation(input: {
+    specId: string;
+    quote: string;
+    prefix?: string;
+    suffix?: string;
+    body: string;
+    author: string;
+    kind: "note" | "question";
+    parentId?: string;
+  }): AnnotationRecord {
+    const id = `ann_${randomUUID().slice(0, 8)}`;
+    const timestamp = nowIso();
+    db.prepare(
+      `INSERT INTO annotations (id, spec_id, quote, prefix, suffix, body, author, status, kind, state, parent_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'open', ?, 'open', ?, ?, ?)`,
+    ).run(
+      id,
+      input.specId,
+      input.quote,
+      input.prefix ?? "",
+      input.suffix ?? "",
+      input.body,
+      input.author,
+      input.kind,
+      input.parentId ?? null,
+      timestamp,
+      timestamp,
+    );
+    if (input.kind === "question") {
+      recordQuestionEvent(id, input.specId, "asked", input.author, input.body);
+    }
+    publishChanged(
+      input.specId,
+      input.kind === "question" ? "question-asked" : "annotated",
+    );
+    const created = annotationById(id);
+    if (created === undefined) throw new Error("Annotation disappeared during create.");
+    return created;
+  }
+
+  function mustFindQuestion(annotationId: string): AnnotationRecord {
+    const annotation = annotationById(annotationId);
+    if (annotation === undefined) {
+      throw new Error(`No annotation with id ${annotationId}.`);
+    }
+    if (annotation.kind !== "question") {
+      throw new Error(`${annotationId} is a note, not a question.`);
+    }
+    return annotation;
+  }
+
+  function answerQuestion(
+    annotationId: string,
+    answer: string,
+    actor: string,
+  ): AnnotationRecord {
+    const question = mustFindQuestion(annotationId);
+    const timestamp = nowIso();
+    db.prepare(
+      `UPDATE annotations SET answer = ?, answered_by = ?, answered_at = ?, state = 'answered', status = 'open', updated_at = ? WHERE id = ?`,
+    ).run(answer, actor, timestamp, timestamp, annotationId);
+    recordQuestionEvent(annotationId, question.spec_id, "answered", actor, answer);
+    publishChanged(question.spec_id, "question-answered");
+    return mustFindQuestion(annotationId);
+  }
+
+  function clarifyQuestion(
+    annotationId: string,
+    question: string,
+    actor: string,
+  ): AnnotationRecord {
+    const parent = mustFindQuestion(annotationId);
+    const child = createAnnotation({
+      specId: parent.spec_id,
+      quote: parent.quote,
+      prefix: parent.prefix,
+      suffix: parent.suffix,
+      body: question,
+      author: actor,
+      kind: "question",
+      parentId: parent.id,
+    });
+    db.prepare(
+      "UPDATE annotations SET state = 'clarify', updated_at = ? WHERE id = ?",
+    ).run(nowIso(), parent.id);
+    recordQuestionEvent(parent.id, parent.spec_id, "clarified", actor, question);
+    publishChanged(parent.spec_id, "question-clarified");
+    return child;
+  }
+
+  function resolveQuestion(
+    annotationId: string,
+    decision: string,
+    actor: string,
+    foldedRevision?: number,
+  ): AnnotationRecord {
+    const question = mustFindQuestion(annotationId);
+    const timestamp = nowIso();
+    db.prepare(
+      `UPDATE annotations SET state = 'resolved', status = 'resolved', decision = ?, resolved_by = ?, resolved_at = ?, folded_revision = ?, updated_at = ? WHERE id = ?`,
+    ).run(
+      decision,
+      actor,
+      timestamp,
+      foldedRevision ?? null,
+      timestamp,
+      annotationId,
+    );
+    recordQuestionEvent(
+      annotationId,
+      question.spec_id,
+      "resolved",
+      actor,
+      decision,
+      foldedRevision ?? null,
+    );
+    publishChanged(question.spec_id, "question-resolved");
+    return mustFindQuestion(annotationId);
+  }
+
+  function dismissQuestion(
+    annotationId: string,
+    reason: string,
+    actor: string,
+  ): AnnotationRecord {
+    const question = mustFindQuestion(annotationId);
+    const timestamp = nowIso();
+    db.prepare(
+      `UPDATE annotations SET state = 'dismissed', status = 'resolved', decision = ?, resolved_by = ?, resolved_at = ?, updated_at = ? WHERE id = ?`,
+    ).run(reason, actor, timestamp, timestamp, annotationId);
+    recordQuestionEvent(annotationId, question.spec_id, "dismissed", actor, reason);
+    publishChanged(question.spec_id, "question-dismissed");
+    return mustFindQuestion(annotationId);
+  }
+
+  function reopenQuestion(annotationId: string, actor: string): AnnotationRecord {
+    const question = mustFindQuestion(annotationId);
+    db.prepare(
+      `UPDATE annotations SET state = 'open', status = 'open', resolved_by = '', resolved_at = NULL, updated_at = ? WHERE id = ?`,
+    ).run(nowIso(), annotationId);
+    recordQuestionEvent(annotationId, question.spec_id, "reopened", actor);
+    publishChanged(question.spec_id, "question-reopened");
+    return mustFindQuestion(annotationId);
   }
 
   function annotationById(annotationId: string): AnnotationRecord | undefined {
@@ -974,7 +1266,24 @@ export default async function plugin(bb: BbPluginApi) {
         ? `${hidden} more spec(s) in this project: specs_search({ query }).`
         : "Search the rest with specs_search({ query }).",
     ].join(" ");
-    return `${[header, ...lines].join("\n")}\n${trailer}`;
+    const questionCounts = db
+      .prepare(
+        `SELECT state, COUNT(*) AS n FROM annotations a
+         WHERE a.kind = 'question' AND a.state IN ('open', 'answered', 'clarify')
+           AND EXISTS (SELECT 1 FROM spec_projects p WHERE p.spec_id = a.spec_id AND p.project_id = ?)
+         GROUP BY state`,
+      )
+      .all(projectId) as Array<{ state: string; n: number }>;
+    const countState = (state: string): number =>
+      questionCounts.find((row) => row.state === state)?.n ?? 0;
+    const questionLine =
+      countState("open") + countState("answered") + countState("clarify") === 0
+        ? ""
+        : [
+            `Open questions: ${countState("open")} open · ${countState("answered")} awaiting triage · ${countState("clarify")} in clarification.`,
+            `List with specs_questions({ projectId }); close with specs_answer, specs_clarify, specs_resolve, or specs_dismiss.`,
+          ].join(" ");
+    return `${[header, ...lines].join("\n")}\n${trailer}${questionLine === "" ? "" : `\n${questionLine}`}`;
   }
 
   function threadLinkMode(
@@ -996,6 +1305,103 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ---- agent tools ---------------------------------------------------------
 
+  interface QuestionRow extends AnnotationRecord {
+    spec_slug: string;
+    spec_title: string;
+  }
+
+  function listQuestions(options: {
+    specId?: string;
+    projectId?: string | null;
+    state?: string;
+    limit?: number;
+  }): QuestionRow[] {
+    const clauses = ["a.kind = 'question'"];
+    const params: unknown[] = [];
+    if (options.specId !== undefined) {
+      clauses.push("a.spec_id = ?");
+      params.push(options.specId);
+    }
+    if (options.projectId != null) {
+      clauses.push(
+        "EXISTS (SELECT 1 FROM spec_projects p WHERE p.spec_id = a.spec_id AND p.project_id = ?)",
+      );
+      params.push(options.projectId);
+    }
+    if (options.state !== undefined && options.state !== "all") {
+      clauses.push("a.state = ?");
+      params.push(options.state);
+    }
+    return db
+      .prepare(
+        `SELECT a.*, s.slug AS spec_slug, s.title AS spec_title
+         FROM annotations a JOIN specs s ON s.id = a.spec_id
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY CASE a.state
+           WHEN 'answered' THEN 0
+           WHEN 'open' THEN 1
+           WHEN 'clarify' THEN 2
+           ELSE 3 END,
+           a.created_at ASC
+         LIMIT ?`,
+      )
+      .all(...params, options.limit ?? 50) as QuestionRow[];
+  }
+
+  interface QuestionLineInput {
+    id: string;
+    state: Annotation["state"];
+    specLabel: string;
+    quote: string;
+    body: string;
+    answer: string;
+    answeredBy: string;
+    answeredAt: string | null;
+    decision: string;
+    resolvedBy: string;
+    foldedRevision: number | null;
+    parentId: string | null;
+    updatedAt: string;
+  }
+
+  function toQuestionLine(row: QuestionRow): QuestionLineInput {
+    return {
+      id: row.id,
+      state: row.state,
+      specLabel: row.spec_slug,
+      quote: row.quote,
+      body: row.body,
+      answer: row.answer,
+      answeredBy: row.answered_by,
+      answeredAt: row.answered_at,
+      decision: row.decision,
+      resolvedBy: row.resolved_by,
+      foldedRevision: row.folded_revision,
+      parentId: row.parent_id,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  function formatQuestionLine(question: QuestionLineInput): string {
+    const lines = [
+      `${question.id} [${question.state}] ${question.specLabel}: "${truncate(question.quote, 60)}" — ${truncate(question.body, 180)}`,
+    ];
+    if (question.answer !== "") {
+      lines.push(
+        `    answer (${question.answeredBy}, ${relativeTime(question.answeredAt ?? question.updatedAt)}): ${truncate(question.answer, 240)}`,
+      );
+    }
+    if (question.decision !== "") {
+      lines.push(
+        `    decision (${question.resolvedBy}): ${truncate(question.decision, 240)}${question.foldedRevision === null ? "" : ` · folded into v${question.foldedRevision}`}`,
+      );
+    }
+    if (question.parentId !== null) {
+      lines.push(`    follow-up of ${question.parentId}`);
+    }
+    return lines.join("\n");
+  }
+
   function toolText(text: string): string {
     return text;
   }
@@ -1013,17 +1419,62 @@ export default async function plugin(bb: BbPluginApi) {
     const projectIds = projectIdsFor(spec.id);
     if (projectIds.length > 0) parts.push(`linked projects: ${projectIds.join(", ")}`);
     if (includeAnnotations) {
-      const open = annotationsFor(spec.id).filter(
-        (annotation) => annotation.status === "open",
+      const annotations = annotationsFor(spec.id);
+      const notes = annotations.filter(
+        (annotation) => annotation.kind === "note" && annotation.status === "open",
       );
-      if (open.length > 0) {
-        parts.push("", "## Open annotations (review feedback)");
-        for (const annotation of open.slice(0, 20)) {
+      const questions = annotations.filter(
+        (annotation) =>
+          annotation.kind === "question" &&
+          annotation.state !== "resolved" &&
+          annotation.state !== "dismissed",
+      );
+      const decisions = annotations
+        .filter(
+          (annotation) =>
+            annotation.kind === "question" && annotation.decision !== "",
+        )
+        .sort((a, b) =>
+          (a.resolvedAt ?? a.updatedAt).localeCompare(b.resolvedAt ?? b.updatedAt),
+        );
+      if (notes.length > 0) {
+        parts.push("", "## Open notes (review feedback)");
+        for (const annotation of notes.slice(0, 20)) {
           const comments = annotation.comments
             .map((comment) => `    - ${comment.author}: ${comment.body}`)
             .join("\n");
           parts.push(
             `- "${truncate(annotation.quote, 160)}" — ${annotation.body} (${annotation.author}, ${relativeTime(annotation.createdAt)})${comments === "" ? "" : `\n${comments}`}`,
+          );
+        }
+      }
+      if (questions.length > 0) {
+        parts.push("", "## Open questions");
+        for (const question of questions.slice(0, 20)) {
+          parts.push(
+            formatQuestionLine({
+              id: question.id,
+              state: question.state,
+              specLabel: spec.slug,
+              quote: question.quote,
+              body: question.body,
+              answer: question.answer,
+              answeredBy: question.answeredBy,
+              answeredAt: question.answeredAt,
+              decision: question.decision,
+              resolvedBy: question.resolvedBy,
+              foldedRevision: question.foldedRevision,
+              parentId: question.parentId,
+              updatedAt: question.updatedAt,
+            }),
+          );
+        }
+      }
+      if (decisions.length > 0) {
+        parts.push("", "## Decisions (audit)");
+        for (const decision of decisions.slice(0, 20)) {
+          parts.push(
+            `- ${decision.id} "${truncate(decision.quote, 120)}" — ${truncate(decision.decision, 240)} (${decision.resolvedBy}, ${relativeTime(decision.resolvedAt ?? decision.updatedAt)}${decision.foldedRevision === null ? "" : `, folded into v${decision.foldedRevision}`})`,
           );
         }
       }
@@ -1193,18 +1644,161 @@ export default async function plugin(bb: BbPluginApi) {
       idOrSlug: z.string().min(1),
       quote: z.string().min(1).max(2000).describe("The exact text being annotated."),
       body: z.string().min(1).max(5000),
+      kind: z
+        .enum(["note", "question"])
+        .optional()
+        .describe("A question enters the answer/clarify/resolve loop; a note is just feedback."),
     }),
-    execute: ({ idOrSlug, quote, body }) => {
+    execute: ({ idOrSlug, quote, body, kind }) => {
       try {
         const spec = mustFindSpec(idOrSlug);
-        const id = `ann_${randomUUID().slice(0, 8)}`;
-        const timestamp = nowIso();
-        db.prepare(
-          `INSERT INTO annotations (id, spec_id, quote, prefix, suffix, body, author, status, created_at, updated_at)
-           VALUES (?, ?, ?, '', '', ?, 'agent', 'open', ?, ?)`,
-        ).run(id, spec.id, quote, body, timestamp, timestamp);
-        publishChanged(spec.id, "annotated");
-        return toolText(`Added annotation ${id} to "${spec.title}".`);
+        const created = createAnnotation({
+          specId: spec.id,
+          quote,
+          body,
+          author: "agent",
+          kind: kind ?? "note",
+        });
+        return toolText(
+          `Added ${created.kind} ${created.id} to "${spec.title}".`,
+        );
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_questions",
+    description:
+      "List open questions across specs: open, answered but untriaged, in clarification, or closed. This is the loop's inbox — answer with specs_answer, ask for clarification with specs_clarify, decide with specs_resolve, or drop with specs_dismiss.",
+    instructions:
+      "Fetch specs_questions when working on a spec: answer what you can from context, clarify what is under-specified, and resolve once a decision is settled.",
+    presentation: {
+      label: { pending: "Listing questions", completed: "Listed questions" },
+      icon: { glyph: "MessageSquare" },
+    },
+    parameters: z.object({
+      specIdOrSlug: z.string().optional(),
+      projectId: z.string().optional(),
+      state: z
+        .enum(["open", "answered", "clarify", "resolved", "dismissed", "all"])
+        .optional()
+        .describe("Defaults to every state; 'answered' is the triage inbox."),
+      limit: z.number().int().min(1).max(100).optional(),
+    }),
+    execute: ({ specIdOrSlug, projectId, state, limit }) => {
+      try {
+        const specId =
+          specIdOrSlug === undefined ? undefined : mustFindSpec(specIdOrSlug).id;
+        const rows = listQuestions({
+          ...(specId === undefined ? {} : { specId }),
+          projectId: projectId ?? null,
+          ...(state === undefined ? {} : { state }),
+          ...(limit === undefined ? {} : { limit }),
+        });
+        if (rows.length === 0) return toolText("No questions match.");
+        return toolText(rows.map((row) => formatQuestionLine(toQuestionLine(row))).join("\n"));
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_answer",
+    description:
+      "Answer an open question. The question moves to 'answered' and waits for triage: either it needs clarification (specs_clarify) or the decision is folded into the spec and closed (specs_resolve).",
+    instructions:
+      "Answer questions you can settle from the spec and project context; use specs_clarify when the question itself is under-specified.",
+    presentation: {
+      label: { pending: "Answering question", completed: "Answered question" },
+      icon: { glyph: "Check" },
+    },
+    parameters: z.object({
+      annotationId: z.string().min(1),
+      answer: z.string().min(1).max(5000),
+    }),
+    execute: ({ annotationId, answer }) => {
+      try {
+        answerQuestion(annotationId, answer, "agent");
+        return toolText(`Answered ${annotationId}. It is now awaiting triage.`);
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_clarify",
+    description:
+      "Ask a follow-up when an answer is not sufficient to decide. The parent question moves to 'clarify' and a linked follow-up question is created and returned.",
+    instructions:
+      "Prefer one sharp follow-up over guessing; the follow-up appears in specs_questions as a new open question.",
+    presentation: {
+      label: { pending: "Asking follow-up", completed: "Asked follow-up" },
+      icon: { glyph: "MessageQuestion" },
+    },
+    parameters: z.object({
+      annotationId: z.string().min(1),
+      question: z.string().min(1).max(5000),
+    }),
+    execute: ({ annotationId, question }) => {
+      try {
+        const child = clarifyQuestion(annotationId, question, "agent");
+        return toolText(
+          `Created follow-up ${child.id} for ${annotationId}. The parent is now in clarification.`,
+        );
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_resolve",
+    description:
+      "Close a question with a decision. Fold the decision into the spec first, then pass that new revision as foldedRevision so the audit trail links the decision to the content that carries it.",
+    instructions:
+      "Resolve only settled questions: write the decision into the spec with specs_write, then call specs_resolve with the resulting revision.",
+    presentation: {
+      label: { pending: "Resolving question", completed: "Resolved question" },
+      icon: { glyph: "CircleCheck" },
+    },
+    parameters: z.object({
+      annotationId: z.string().min(1),
+      decision: z.string().min(1).max(5000),
+      foldedRevision: z.number().int().optional(),
+    }),
+    execute: ({ annotationId, decision, foldedRevision }) => {
+      try {
+        resolveQuestion(annotationId, decision, "agent", foldedRevision);
+        return toolText(
+          `Resolved ${annotationId}${foldedRevision === undefined ? "" : ` · decision linked to spec revision ${foldedRevision}`}.`,
+        );
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_dismiss",
+    description:
+      "Drop a question without deciding it (out of scope, duplicate, no longer relevant). The reason is recorded in the audit history.",
+    instructions: "Dismiss instead of resolving when no decision is needed.",
+    presentation: {
+      label: { pending: "Dismissing question", completed: "Dismissed question" },
+      icon: { glyph: "Archive" },
+    },
+    parameters: z.object({
+      annotationId: z.string().min(1),
+      reason: z.string().max(5000).optional(),
+    }),
+    execute: ({ annotationId, reason }) => {
+      try {
+        dismissQuestion(annotationId, reason ?? "", "agent");
+        return toolText(`Dismissed ${annotationId}.`);
       } catch (error) {
         return toolError(error instanceof Error ? error.message : String(error));
       }
@@ -1293,6 +1887,11 @@ export default async function plugin(bb: BbPluginApi) {
     "specs_write",
     "specs_create",
     "specs_annotate",
+    "specs_questions",
+    "specs_answer",
+    "specs_clarify",
+    "specs_resolve",
+    "specs_dismiss",
     "specs_attach",
     "specs_detach",
     "specs_delete",
@@ -1466,17 +2065,44 @@ export default async function plugin(bb: BbPluginApi) {
       return { ok: true as const };
     },
 
-    annotations_create: ({ specId, quote, prefix, suffix, body }) => {
+    annotations_create: ({ specId, quote, prefix, suffix, body, kind }) => {
       const spec = findSpecById(specId);
       if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
-      const id = `ann_${randomUUID().slice(0, 8)}`;
-      const timestamp = nowIso();
-      db.prepare(
-        `INSERT INTO annotations (id, spec_id, quote, prefix, suffix, body, author, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'user', 'open', ?, ?)`,
-      ).run(id, specId, quote, prefix ?? "", suffix ?? "", body, timestamp, timestamp);
-      publishChanged(specId, "annotated");
-      return { id };
+      const created = createAnnotation({
+        specId,
+        quote,
+        prefix,
+        suffix,
+        body,
+        author: "user",
+        kind: kind ?? "note",
+      });
+      return { id: created.id };
+    },
+
+    questions_answer: ({ annotationId, answer }) => {
+      answerQuestion(annotationId, answer, "user");
+      return { ok: true as const };
+    },
+
+    questions_clarify: ({ annotationId, question }) => {
+      const child = clarifyQuestion(annotationId, question, "user");
+      return { childId: child.id };
+    },
+
+    questions_resolve: ({ annotationId, decision, foldedRevision }) => {
+      resolveQuestion(annotationId, decision, "user", foldedRevision);
+      return { ok: true as const };
+    },
+
+    questions_dismiss: ({ annotationId, reason }) => {
+      dismissQuestion(annotationId, reason ?? "", "user");
+      return { ok: true as const };
+    },
+
+    questions_reopen: ({ annotationId }) => {
+      reopenQuestion(annotationId, "user");
+      return { ok: true as const };
     },
 
     annotations_comment: ({ annotationId, body }) => {
@@ -1494,6 +2120,15 @@ export default async function plugin(bb: BbPluginApi) {
       const annotation = annotationById(annotationId);
       if (annotation === undefined) {
         throw new Error(`No annotation with id ${annotationId}.`);
+      }
+      if (annotation.kind === "question") {
+        if (status === "open") {
+          reopenQuestion(annotationId, "user");
+          return { ok: true as const };
+        }
+        throw new Error(
+          "Resolve questions with questions_resolve (a decision) or questions_dismiss.",
+        );
       }
       db.prepare("UPDATE annotations SET status = ?, updated_at = ? WHERE id = ?").run(
         status,
@@ -1662,7 +2297,12 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb specs detach <id-or-slug> [--thread <thread-id>] [--json]",
     "  bb specs link <id-or-slug> --project <id> [--mode pinned|auto|available] [--json]",
     "  bb specs unlink <id-or-slug> --project <id> [--json]",
-    "  bb specs annotate <id-or-slug> --quote <text> --body <text> [--json]",
+    "  bb specs annotate <id-or-slug> --quote <text> --body <text> [--kind note|question] [--json]",
+    "  bb specs questions [<id-or-slug>] [--state open|answered|clarify|resolved|dismissed|all] [--project <id>] [--json]",
+    "  bb specs answer <annotation-id> --text <answer> [--json]",
+    "  bb specs clarify <annotation-id> <follow-up question> [--json]",
+    "  bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]",
+    "  bb specs dismiss <annotation-id> [--reason <text>] [--json]",
     "  bb specs annotations <id-or-slug> [--all] [--json]",
     "  bb specs resolve <annotation-id> [--json]",
     "  bb specs history <id-or-slug> [--limit <n>] [--json]",
@@ -1688,7 +2328,12 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "detach", summary: "Detach a spec from a thread's context", usage: "bb specs detach <id-or-slug> [--thread <id>] [--json]" },
       { name: "link", summary: "Link a spec to a project", usage: "bb specs link <id-or-slug> --project <id> [--mode pinned|auto|available] [--json]" },
       { name: "unlink", summary: "Unlink a spec from a project", usage: "bb specs unlink <id-or-slug> --project <id> [--json]" },
-      { name: "annotate", summary: "Annotate a spec", usage: "bb specs annotate <id-or-slug> --quote <text> --body <text> [--json]" },
+      { name: "annotate", summary: "Annotate a spec with a note or question", usage: "bb specs annotate <id-or-slug> --quote <text> --body <text> [--kind note|question] [--json]" },
+      { name: "questions", summary: "List questions and their loop state", usage: "bb specs questions [<id-or-slug>] [--state <state>] [--project <id>] [--json]" },
+      { name: "answer", summary: "Answer a question for triage", usage: "bb specs answer <annotation-id> --text <answer> [--json]" },
+      { name: "clarify", summary: "Ask a follow-up question", usage: "bb specs clarify <annotation-id> <follow-up question> [--json]" },
+      { name: "resolve-question", summary: "Close a question with a decision", usage: "bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]" },
+      { name: "dismiss", summary: "Drop a question without deciding", usage: "bb specs dismiss <annotation-id> [--reason <text>] [--json]" },
       { name: "annotations", summary: "List annotations", usage: "bb specs annotations <id-or-slug> [--all] [--json]" },
       { name: "resolve", summary: "Resolve an annotation", usage: "bb specs resolve <annotation-id> [--json]" },
       { name: "history", summary: "List spec revisions", usage: "bb specs history <id-or-slug> [--limit <n>] [--json]" },
@@ -1882,14 +2527,83 @@ export default async function plugin(bb: BbPluginApi) {
               return fail(usage);
             }
             const spec = mustFindSpec(idOrSlug);
-            const id = `ann_${randomUUID().slice(0, 8)}`;
-            const timestamp = nowIso();
-            db.prepare(
-              `INSERT INTO annotations (id, spec_id, quote, prefix, suffix, body, author, status, created_at, updated_at)
-               VALUES (?, ?, ?, '', '', ?, 'cli', 'open', ?, ?)`,
-            ).run(id, spec.id, quote, body, timestamp, timestamp);
-            publishChanged(spec.id, "annotated");
-            return reply({ ok: true, id }, `Added annotation ${id}.`);
+            const kind = flagString("kind") === "question" ? "question" : "note";
+            const created = createAnnotation({
+              specId: spec.id,
+              quote,
+              body,
+              author: "cli",
+              kind,
+            });
+            return reply(
+              { ok: true, id: created.id, kind: created.kind },
+              `Added ${created.kind} ${created.id}.`,
+            );
+          }
+
+          case "questions": {
+            const idOrSlug = rest[0];
+            const specId =
+              idOrSlug === undefined ? undefined : mustFindSpec(idOrSlug).id;
+            const state = flagString("state") ?? "all";
+            const rows = listQuestions({
+              ...(specId === undefined ? {} : { specId }),
+              projectId: flagString("project") ?? null,
+              state,
+            });
+            if (json) return reply(rows, "");
+            return reply(
+              rows,
+              rows.length === 0 ? "No questions." : rows.map((row) => formatQuestionLine(toQuestionLine(row))).join("\n"),
+            );
+          }
+
+          case "answer": {
+            const annotationId = rest[0];
+            const answer = flagString("text") ?? rest.slice(1).join(" ").trim();
+            if (annotationId === undefined || answer === "") return fail(usage);
+            answerQuestion(annotationId, answer, "cli");
+            return reply(
+              { ok: true, annotationId },
+              `Answered ${annotationId}; it is awaiting triage.`,
+            );
+          }
+
+          case "clarify": {
+            const annotationId = rest[0];
+            const question = rest.slice(1).join(" ").trim();
+            if (annotationId === undefined || question === "") return fail(usage);
+            const child = clarifyQuestion(annotationId, question, "cli");
+            return reply(
+              { ok: true, childId: child.id },
+              `Created follow-up ${child.id} for ${annotationId}.`,
+            );
+          }
+
+          case "resolve-question": {
+            const annotationId = rest[0];
+            const decision =
+              flagString("decision") ?? rest.slice(1).join(" ").trim();
+            const foldedRaw = flagString("folded-revision");
+            const foldedRevision =
+              foldedRaw === undefined ? undefined : Number.parseInt(foldedRaw, 10);
+            if (annotationId === undefined || decision === "") return fail(usage);
+            resolveQuestion(
+              annotationId,
+              decision,
+              "cli",
+              foldedRevision === undefined || Number.isNaN(foldedRevision)
+                ? undefined
+                : foldedRevision,
+            );
+            return reply({ ok: true, annotationId }, `Resolved ${annotationId}.`);
+          }
+
+          case "dismiss": {
+            const annotationId = rest[0];
+            if (annotationId === undefined) return fail(usage);
+            dismissQuestion(annotationId, flagString("reason") ?? "", "cli");
+            return reply({ ok: true, annotationId }, `Dismissed ${annotationId}.`);
           }
 
           case "annotations": {

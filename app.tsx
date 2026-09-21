@@ -103,6 +103,7 @@ interface SelectionMenu extends QuoteLocation {
 
 interface AnnotationDraft extends SelectionMenu {
   body: string;
+  kind: "note" | "question";
 }
 
 function collectTextNodes(container: HTMLElement): Text[] {
@@ -795,23 +796,63 @@ function EmojiPickerDialog({
 // Comments rail
 // ---------------------------------------------------------------------------
 
+type QuestionAction = "answer" | "clarify" | "resolve" | "dismiss";
+
+const QUESTION_STATE_LABELS: Record<Annotation["state"], string> = {
+  open: "Open",
+  answered: "Answered",
+  clarify: "Clarifying",
+  resolved: "Resolved",
+  dismissed: "Dismissed",
+};
+
+function questionStateChip(state: Annotation["state"]): string {
+  if (state === "open") return "bg-primary/15 text-primary";
+  if (state === "answered") return "bg-secondary text-foreground";
+  return "bg-secondary/60 text-muted-foreground";
+}
+
+const QUESTION_FORMS: Record<
+  QuestionAction,
+  { placeholder: string; submit: string }
+> = {
+  answer: { placeholder: "Answer from the spec and project context…", submit: "Save answer" },
+  clarify: { placeholder: "What needs to be clearer before this can be decided?", submit: "Ask follow-up" },
+  resolve: { placeholder: "The decision, in one or two sentences…", submit: "Resolve" },
+  dismiss: { placeholder: "Why is this no longer worth deciding? (optional)", submit: "Dismiss" },
+};
+
 function CommentCard({
   annotation,
   onReply,
   onStatus,
   onRemove,
   onLocate,
+  onAnswer,
+  onClarify,
+  onResolve,
+  onDismiss,
+  onReopen,
 }: {
   annotation: Annotation;
   onReply: (body: string) => Promise<void>;
   onStatus: (status: "open" | "resolved") => Promise<void>;
   onRemove: () => Promise<void>;
   onLocate: () => void;
+  onAnswer: (answer: string) => Promise<void>;
+  onClarify: (question: string) => Promise<void>;
+  onResolve: (decision: string) => Promise<void>;
+  onDismiss: (reason: string) => Promise<void>;
+  onReopen: () => Promise<void>;
 }) {
   const [reply, setReply] = useState("");
+  const [form, setForm] = useState<QuestionAction | null>(null);
+  const [formText, setFormText] = useState("");
+  const [eventsOpen, setEventsOpen] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
-  const resolved = annotation.status === "resolved";
+  const isQuestion = annotation.kind === "question";
+  const closed = annotation.status === "resolved";
 
   const sendReply = () => {
     const value = reply.trim();
@@ -820,62 +861,259 @@ function CommentCard({
     void onReply(value);
   };
 
+  const openForm = (action: QuestionAction) => {
+    setForm(action);
+    setFormText("");
+  };
+
+  const submitForm = async () => {
+    if (form === null || busy) return;
+    const value = formText.trim();
+    if (value === "" && form !== "dismiss") return;
+    setBusy(true);
+    try {
+      if (form === "answer") await onAnswer(value);
+      else if (form === "clarify") await onClarify(value);
+      else if (form === "resolve") await onResolve(value);
+      else await onDismiss(value);
+      setForm(null);
+      setFormText("");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const hoverActions = (
+    <span className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
+      <IconButton label="Find in document" onClick={onLocate} compact>
+        <Icon name="Target" className="size-3.5" />
+      </IconButton>
+      {isQuestion ? null : (
+        <IconButton
+          label={closed ? "Reopen" : "Resolve"}
+          compact
+          onClick={() => {
+            if (busy) return;
+            setBusy(true);
+            void onStatus(closed ? "open" : "resolved").finally(() => setBusy(false));
+          }}
+        >
+          <Icon name="Check" className="size-3.5" />
+        </IconButton>
+      )}
+      <IconButton
+        label={confirming ? "Confirm delete" : "Delete"}
+        compact
+        onClick={() => {
+          if (!confirming) {
+            setConfirming(true);
+            return;
+          }
+          void onRemove();
+        }}
+        className={confirming ? "text-destructive" : undefined}
+      >
+        <Icon name="Trash2" className="size-3.5" />
+      </IconButton>
+    </span>
+  );
+
   return (
     <div
       className={cn(
         "specs-hairline group rounded-xl bg-card p-3",
-        resolved && "opacity-75",
+        closed && "opacity-80",
       )}
     >
       <div className="flex items-start gap-2.5">
         <Avatar name={annotation.author} />
         <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="text-xs font-medium">
               {displayAuthor(annotation.author)}
             </span>
+            {isQuestion ? (
+              <span className="rounded-md bg-secondary px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                Question
+              </span>
+            ) : null}
+            {isQuestion ? (
+              <span
+                className={cn(
+                  "rounded-md px-1.5 py-0.5 text-[10px] font-medium",
+                  questionStateChip(annotation.state),
+                )}
+              >
+                {QUESTION_STATE_LABELS[annotation.state]}
+              </span>
+            ) : null}
             <span className="text-[11px] text-muted-foreground tabular-nums">
               {relativeTime(annotation.createdAt)}
             </span>
-            <span className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
-              <IconButton label="Find in document" onClick={onLocate} compact>
-                <Icon name="Target" className="size-3.5" />
-              </IconButton>
-              <IconButton
-                label={resolved ? "Reopen" : "Resolve"}
-                compact
-                onClick={() => {
-                  if (busy) return;
-                  setBusy(true);
-                  void onStatus(resolved ? "open" : "resolved").finally(() =>
-                    setBusy(false),
-                  );
-                }}
-              >
-                <Icon name="Check" className="size-3.5" />
-              </IconButton>
-              <IconButton
-                label={confirming ? "Confirm delete" : "Delete comment"}
-                compact
-                onClick={() => {
-                  if (!confirming) {
-                    setConfirming(true);
-                    return;
-                  }
-                  void onRemove();
-                }}
-                className={confirming ? "text-destructive" : undefined}
-              >
-                <Icon name="Trash2" className="size-3.5" />
-              </IconButton>
-            </span>
+            {hoverActions}
           </div>
+
           <blockquote className="mt-1.5 border-l-2 border-primary/40 pl-2.5 text-xs leading-relaxed text-muted-foreground">
             {truncate(annotation.quote, 180)}
           </blockquote>
           <div className="mt-1.5 text-sm leading-relaxed">
             <Markdown content={annotation.body} />
           </div>
+
+          {isQuestion && annotation.answer !== "" ? (
+            <div className="mt-2 rounded-lg bg-secondary/50 px-2.5 py-2">
+              <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                Answer · {displayAuthor(annotation.answeredBy)} ·{" "}
+                {relativeTime(annotation.answeredAt ?? annotation.updatedAt)}
+              </p>
+              <div className="mt-0.5 text-sm leading-relaxed">
+                <Markdown content={annotation.answer} />
+              </div>
+            </div>
+          ) : null}
+
+          {isQuestion && annotation.decision !== "" ? (
+            <div className="mt-2 rounded-lg border border-border px-2.5 py-2">
+              <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground tabular-nums">
+                Decision · {displayAuthor(annotation.resolvedBy)} ·{" "}
+                {relativeTime(annotation.resolvedAt ?? annotation.updatedAt)}
+                {annotation.foldedRevision === null
+                  ? ""
+                  : ` · folded into v${annotation.foldedRevision}`}
+              </p>
+              <div className="mt-0.5 text-sm leading-relaxed">
+                <Markdown content={annotation.decision} />
+              </div>
+            </div>
+          ) : null}
+
+          {isQuestion && annotation.parentId !== null ? (
+            <p className="mt-1.5 text-[11px] text-muted-foreground">
+              Follow-up of {annotation.parentId}
+            </p>
+          ) : null}
+
+          {isQuestion && annotation.events.length > 0 ? (
+            <div className="mt-2">
+              <button
+                type="button"
+                onClick={() => setEventsOpen((current) => !current)}
+                className="specs-press cursor-pointer text-[11px] text-muted-foreground hover:text-foreground"
+              >
+                {eventsOpen ? "Hide history" : `History (${annotation.events.length})`}
+              </button>
+              {eventsOpen ? (
+                <ul className="mt-1.5 space-y-1 border-l border-border pl-2.5">
+                  {annotation.events.map((event) => (
+                    <li
+                      key={event.id}
+                      className="text-[11px] text-muted-foreground tabular-nums"
+                    >
+                      <span className="font-medium text-foreground/80">
+                        {event.event}
+                      </span>{" "}
+                      · {displayAuthor(event.actor)} · {relativeTime(event.createdAt)}
+                      {event.revision === null ? "" : ` · v${event.revision}`}
+                      {event.note === "" ? "" : ` — ${truncate(event.note, 120)}`}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+
+          {isQuestion ? (
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
+              {closed ? (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 px-2.5"
+                  disabled={busy}
+                  onClick={() => {
+                    setBusy(true);
+                    void onReopen().finally(() => setBusy(false));
+                  }}
+                >
+                  Reopen
+                </Button>
+              ) : (
+                <>
+                  <Button
+                    size="sm"
+                    className="h-7 px-2.5"
+                    onClick={() => openForm("answer")}
+                  >
+                    {annotation.answer === "" ? "Answer" : "Edit answer"}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2.5"
+                    onClick={() => openForm("clarify")}
+                  >
+                    Needs clarification
+                  </Button>
+                  {annotation.state === "answered" ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="h-7 px-2.5"
+                      onClick={() => openForm("resolve")}
+                    >
+                      Resolve with decision
+                    </Button>
+                  ) : null}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 px-2.5 text-muted-foreground"
+                    onClick={() => openForm("dismiss")}
+                  >
+                    Dismiss
+                  </Button>
+                </>
+              )}
+            </div>
+          ) : null}
+
+          {form === null ? null : (
+            <div className="mt-2">
+              <textarea
+                autoFocus
+                value={formText}
+                onChange={(event) => setFormText(event.target.value)}
+                placeholder={QUESTION_FORMS[form].placeholder}
+                className={cn(textareaClassName, "h-20 rounded-xl text-sm")}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                    event.preventDefault();
+                    void submitForm();
+                  }
+                  if (event.key === "Escape") setForm(null);
+                }}
+              />
+              <div className="mt-1.5 flex items-center justify-end gap-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2"
+                  onClick={() => setForm(null)}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  size="sm"
+                  className="h-7 px-2.5"
+                  disabled={busy || (form !== "dismiss" && formText.trim() === "")}
+                  onClick={() => void submitForm()}
+                >
+                  {busy ? "Saving…" : QUESTION_FORMS[form].submit}
+                </Button>
+              </div>
+            </div>
+          )}
+
           {annotation.comments.length > 0 ? (
             <ul className="mt-2 space-y-2 border-t border-border pt-2">
               {annotation.comments.map((comment) => (
@@ -898,6 +1136,7 @@ function CommentCard({
               ))}
             </ul>
           ) : null}
+
           <div className="mt-2 flex items-center gap-2">
             <Input
               value={reply}
@@ -934,6 +1173,11 @@ function CommentsRail({
   onStatus,
   onRemove,
   onLocate,
+  onAnswer,
+  onClarify,
+  onResolve,
+  onDismiss,
+  onReopen,
 }: {
   annotations: Annotation[];
   onClose: () => void;
@@ -941,42 +1185,53 @@ function CommentsRail({
   onStatus: (annotationId: string, status: "open" | "resolved") => Promise<void>;
   onRemove: (annotationId: string) => Promise<void>;
   onLocate: (annotation: Annotation) => void;
+  onAnswer: (annotationId: string, answer: string) => Promise<void>;
+  onClarify: (annotationId: string, question: string) => Promise<void>;
+  onResolve: (annotationId: string, decision: string) => Promise<void>;
+  onDismiss: (annotationId: string, reason: string) => Promise<void>;
+  onReopen: (annotationId: string) => Promise<void>;
 }) {
-  const [filter, setFilter] = useState<"open" | "resolved">("open");
-  const open = annotations.filter((annotation) => annotation.status === "open");
-  const resolved = annotations.filter(
-    (annotation) => annotation.status === "resolved",
+  const [filter, setFilter] = useState<"open" | "answered" | "history">("open");
+  const openItems = annotations.filter((annotation) => annotation.status === "open");
+  const answeredItems = annotations.filter(
+    (annotation) => annotation.kind === "question" && annotation.state === "answered",
   );
-  const shown = filter === "open" ? open : resolved;
+  const historyItems = annotations
+    .filter((annotation) => annotation.status === "resolved")
+    .sort((a, b) =>
+      (b.resolvedAt ?? b.updatedAt).localeCompare(a.resolvedAt ?? a.updatedAt),
+    );
+  const shown =
+    filter === "open"
+      ? openItems
+      : filter === "answered"
+        ? answeredItems
+        : historyItems;
+  const segments: Array<["open" | "answered" | "history", string, number]> = [
+    ["open", "Open", openItems.length],
+    ["answered", "Answered", answeredItems.length],
+    ["history", "History", historyItems.length],
+  ];
 
   return (
     <>
       <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
-        <span className="min-w-0 flex-1 text-xs font-medium">
-          Comments
-          <span className="ml-1.5 text-muted-foreground tabular-nums">
-            {open.length}
-          </span>
-        </span>
+        <span className="min-w-0 flex-1 text-xs font-medium">Comments</span>
         <div className="flex items-center rounded-lg bg-secondary/60 p-0.5">
-          {(
-            [
-              ["open", `Open`],
-              ["resolved", `Resolved`],
-            ] as Array<["open" | "resolved", string]>
-          ).map(([value, label]) => (
+          {segments.map(([value, label, count]) => (
             <button
               key={value}
               type="button"
               onClick={() => setFilter(value)}
               className={cn(
-                "specs-press cursor-pointer rounded-[6px] px-2 py-1 text-[11px]",
+                "specs-press cursor-pointer rounded-[6px] px-2 py-1 text-[11px] tabular-nums",
                 filter === value
                   ? "bg-background text-foreground shadow-sm"
                   : "text-muted-foreground hover:text-foreground",
               )}
             >
               {label}
+              {count > 0 ? ` ${count}` : ""}
             </button>
           ))}
         </div>
@@ -989,8 +1244,10 @@ function CommentsRail({
           <div className="pt-6">
             <EmptyState>
               {filter === "open"
-                ? "No open comments. Select text in the document to add one."
-                : "No resolved comments yet."}
+                ? "No open comments or questions. Select text in the document to add one."
+                : filter === "answered"
+                  ? "No answers waiting for triage."
+                  : "No decisions or resolved comments yet."}
             </EmptyState>
           </div>
         ) : (
@@ -1002,6 +1259,11 @@ function CommentsRail({
               onStatus={(status) => onStatus(annotation.id, status)}
               onRemove={() => onRemove(annotation.id)}
               onLocate={() => onLocate(annotation)}
+              onAnswer={(answer) => onAnswer(annotation.id, answer)}
+              onClarify={(question) => onClarify(annotation.id, question)}
+              onResolve={(decision) => onResolve(annotation.id, decision)}
+              onDismiss={(reason) => onDismiss(annotation.id, reason)}
+              onReopen={() => onReopen(annotation.id)}
             />
           ))
         )}
@@ -1392,10 +1654,12 @@ function SpecsPage({ subPath }: { subPath: string }) {
         prefix: annotationDraft.prefix,
         suffix: annotationDraft.suffix,
         body,
+        kind: annotationDraft.kind,
       });
+      const wasQuestion = annotationDraft.kind === "question";
       setAnnotationDraft(null);
       setRailAndNavigate("comments");
-      toast.success("Comment added");
+      toast.success(wasQuestion ? "Question added" : "Comment added");
       refetchDetail(selectedSlug);
     } catch (cause) {
       toast.error(messageOf(cause));
@@ -1736,6 +2000,50 @@ function SpecsPage({ subPath }: { subPath: string }) {
                 }
               }}
               onLocate={locateAnnotation}
+              onAnswer={async (annotationId, answer) => {
+                try {
+                  await rpc.call("questions_answer", { annotationId, answer });
+                  toast.success("Answered — waiting for triage");
+                  refetchDetail(selectedSlug);
+                } catch (cause) {
+                  toast.error(messageOf(cause));
+                }
+              }}
+              onClarify={async (annotationId, question) => {
+                try {
+                  await rpc.call("questions_clarify", { annotationId, question });
+                  toast.success("Follow-up question added");
+                  refetchDetail(selectedSlug);
+                } catch (cause) {
+                  toast.error(messageOf(cause));
+                }
+              }}
+              onResolve={async (annotationId, decision) => {
+                try {
+                  await rpc.call("questions_resolve", { annotationId, decision });
+                  toast.success("Question resolved");
+                  refetchDetail(selectedSlug);
+                } catch (cause) {
+                  toast.error(messageOf(cause));
+                }
+              }}
+              onDismiss={async (annotationId, reason) => {
+                try {
+                  await rpc.call("questions_dismiss", { annotationId, reason });
+                  toast.success("Question dismissed");
+                  refetchDetail(selectedSlug);
+                } catch (cause) {
+                  toast.error(messageOf(cause));
+                }
+              }}
+              onReopen={async (annotationId) => {
+                try {
+                  await rpc.call("questions_reopen", { annotationId });
+                  refetchDetail(selectedSlug);
+                } catch (cause) {
+                  toast.error(messageOf(cause));
+                }
+              }}
             />
           ) : detail.chatThreadId === null ? (
             <>
@@ -1815,7 +2123,7 @@ function SpecsPage({ subPath }: { subPath: string }) {
           <button
             type="button"
             onClick={() => {
-              setAnnotationDraft({ ...selectionMenu, body: "" });
+              setAnnotationDraft({ ...selectionMenu, body: "", kind: "note" });
               setSelectionMenu(null);
             }}
             className="specs-press flex cursor-pointer items-center gap-1.5 rounded-lg bg-foreground px-2.5 py-1.5 text-xs font-medium text-background hover:bg-foreground/90"
@@ -1834,6 +2142,32 @@ function SpecsPage({ subPath }: { subPath: string }) {
           <blockquote className="border-l-2 border-primary/40 pl-2.5 text-xs leading-relaxed text-muted-foreground">
             {truncate(annotationDraft.quote, 180)}
           </blockquote>
+          <div className="mt-2 flex items-center rounded-lg bg-secondary/60 p-0.5">
+            {(
+              [
+                ["note", "Comment"],
+                ["question", "Question"],
+              ] as Array<["note" | "question", string]>
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() =>
+                  setAnnotationDraft((current) =>
+                    current === null ? current : { ...current, kind: value },
+                  )
+                }
+                className={cn(
+                  "specs-press flex-1 cursor-pointer rounded-[6px] px-2 py-1 text-[11px]",
+                  annotationDraft.kind === value
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <textarea
             autoFocus
             value={annotationDraft.body}
@@ -1851,12 +2185,16 @@ function SpecsPage({ subPath }: { subPath: string }) {
               }
               if (event.key === "Escape") setAnnotationDraft(null);
             }}
-            placeholder="Add a comment…"
+            placeholder={
+              annotationDraft.kind === "question"
+                ? "Ask a question an agent should answer or decide…"
+                : "Add a comment…"
+            }
             className={cn(textareaClassName, "mt-2 h-24 rounded-xl")}
           />
           <div className="mt-2 flex items-center justify-end gap-2">
             <span className="mr-auto text-[10px] text-muted-foreground">
-              ⌘↵ to comment
+              ⌘↵ to add
             </span>
             <Button
               size="sm"
@@ -1872,7 +2210,7 @@ function SpecsPage({ subPath }: { subPath: string }) {
               disabled={annotationDraft.body.trim() === ""}
               onClick={() => void submitAnnotation()}
             >
-              Comment
+              {annotationDraft.kind === "question" ? "Ask" : "Comment"}
             </Button>
           </div>
         </div>

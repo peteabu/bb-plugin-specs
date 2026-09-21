@@ -25,12 +25,42 @@ in the injected context; full content is pulled on demand.
 | `specs_read` | Full content plus open annotations. Accepts id or slug. Marks the revision as seen. |
 | `specs_write` | Update content/title/summary. Pass `expectedRevision` from the read; a conflict means re-read and merge. |
 | `specs_create` | Create a spec, link it to a project, attach it to this thread. |
-| `specs_annotate` | Leave a quoted review note without changing the text. |
+| `specs_annotate` | Leave a quoted note, or `kind: "question"` to open one that enters the question loop. |
+| `specs_questions` | The loop's inbox: list questions by state across a spec or project. |
+| `specs_answer` | Answer an open question; it moves to answered and waits for triage. |
+| `specs_clarify` | Ask a follow-up when an answer is not enough to decide. |
+| `specs_resolve` | Close a question with a decision, linked to the spec revision that carries it. |
+| `specs_dismiss` | Drop a question without deciding (out of scope, duplicate). |
 | `specs_attach` / `specs_detach` | Add or remove a spec from this thread's context. |
 | `specs_delete` | Permanently delete a spec, its revisions, and its annotations. Its chat thread is archived. Only on explicit request. |
 
 The same operations exist as `bb specs ...` (see `bb specs help`) for scripts
 and manual runs.
+
+## The question loop
+
+Questions are annotations with `kind: "question"` and a lifecycle. Run the loop
+instead of answering once and moving on:
+
+1. **Fetch** with `specs_questions` (or `bb specs questions`). States sort as
+   `answered` (triage inbox) → `open` → `clarify` → closed.
+2. **Answer** with `specs_answer` when the spec and project context settle it.
+   The question moves to `answered` and waits for triage.
+3. **Triage the answer**: is it enough to decide?
+   - No → `specs_clarify` with one sharp follow-up. The parent moves to
+     `clarify` and the follow-up appears as a new open question.
+   - Yes → fold the decision into the document:
+     `specs_write` the changed content, then `specs_resolve` with the decision
+     and the new revision as `foldedRevision`.
+4. **Dismiss** (`specs_dismiss`) only when no decision is needed; the reason is
+   recorded.
+
+Every transition is append-only in each question's `events` history: who asked,
+answered, clarified, decided, or dismissed, when, and which revision carries a
+folded decision. `specs_read` returns open questions and the decision audit
+trail, so a later thread can see why the spec says what it says. Never edit a
+decided question's decision into silence — reopen it (`specs_reopen`) or open a
+new question that references it.
 
 ## Conventions
 
