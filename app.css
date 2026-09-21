@@ -308,3 +308,7 @@ mark.specs-annotation-mark {
   text-decoration-color: color-mix(in oklab, var(--primary) 65%, transparent);
   text-underline-offset: 2px;
 }
+
+.specs-popover {
+  max-width: calc(100vw - 24px);
+}

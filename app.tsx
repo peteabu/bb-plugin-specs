@@ -423,7 +423,7 @@ function SpecsSidebar({
   );
 
   return (
-    <aside className="flex w-[264px] shrink-0 flex-col border-r border-border">
+    <aside className="hidden w-[264px] shrink-0 flex-col border-r border-border md:flex">
       <div className="space-y-2 px-3 pb-2 pt-3">
         <div className="flex items-center justify-between px-1">
           <span className="text-sm font-semibold tracking-tight">Specs</span>
@@ -1732,7 +1732,7 @@ function SpecsPage({ subPath }: { subPath: string }) {
           .join(", ");
 
   return (
-    <div className="specs-root flex h-full min-h-0 w-full bg-background text-foreground">
+    <div className="specs-root relative flex h-full min-h-0 w-full bg-background text-foreground">
       <SpecsSidebar
         specs={specs}
         projects={projects}
@@ -1754,6 +1754,25 @@ function SpecsPage({ subPath }: { subPath: string }) {
                   <p className="text-sm text-muted-foreground">
                     Select a spec, or start a new one.
                   </p>
+                  {(specs ?? []).length > 0 ? (
+                    <select
+                      aria-label="Select spec"
+                      defaultValue=""
+                      className="mx-auto block w-full max-w-xs rounded-md border border-input bg-transparent px-2 py-1.5 text-sm"
+                      onChange={(event) => {
+                        if (event.target.value !== "") selectSpec(event.target.value);
+                      }}
+                    >
+                      <option value="" disabled>
+                        Choose a spec…
+                      </option>
+                      {(specs ?? []).map((spec) => (
+                        <option key={spec.id} value={spec.slug}>
+                          {spec.title}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
                 </div>
               ) : (
                 <ErrorText>{detailError}</ErrorText>
@@ -1773,10 +1792,32 @@ function SpecsPage({ subPath }: { subPath: string }) {
         ) : (
           <>
             <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
-              <span className="min-w-0 flex-1 truncate text-xs text-muted-foreground">
+              <div className="min-w-0 flex-1 md:hidden">
+                <select
+                  aria-label="Select spec"
+                  className="h-8 w-full truncate rounded-md bg-secondary/50 px-2 text-xs text-foreground"
+                  value={selectedSlug}
+                  onChange={(event) => selectSpec(event.target.value)}
+                >
+                  {(specs ?? []).map((spec) => (
+                    <option key={spec.id} value={spec.slug}>
+                      {spec.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <span className="hidden min-w-0 flex-1 truncate text-xs text-muted-foreground md:block">
                 {projectLabel}
                 <span className="px-1.5 opacity-50">/</span>
                 <span className="text-foreground/80">{detail.spec.title}</span>
+              </span>
+              <span className="md:hidden">
+                <IconButton
+                  label="New spec"
+                  onClick={() => void createSpec(defaultProjectId)}
+                >
+                  <Icon name="Plus" className="size-4" />
+                </IconButton>
               </span>
               {editing ? (
                 <>
@@ -1868,13 +1909,13 @@ function SpecsPage({ subPath }: { subPath: string }) {
                       if (event.key === "Escape") cancelEdit();
                     }}
                     placeholder="Untitled"
-                    className="w-full bg-transparent text-4xl font-semibold tracking-tight text-foreground outline-none placeholder:text-muted-foreground/40"
+                    className="w-full bg-transparent text-3xl font-semibold tracking-tight text-foreground outline-none placeholder:text-muted-foreground/40 md:text-4xl"
                   />
                 ) : (
                   <h1
                     onClick={beginEdit}
                     title="Click to edit"
-                    className="cursor-text text-4xl font-semibold tracking-tight text-balance"
+                    className="cursor-text text-3xl font-semibold tracking-tight text-balance md:text-4xl"
                   >
                     {detail.spec.title}
                   </h1>
@@ -1969,7 +2010,7 @@ function SpecsPage({ subPath }: { subPath: string }) {
       </main>
 
       {detail !== null && rail !== "none" ? (
-        <aside className="specs-rail flex w-[340px] shrink-0 flex-col overflow-hidden border-l border-border">
+        <aside className="specs-rail absolute inset-y-0 right-0 z-40 flex w-full flex-col overflow-hidden border-l border-border bg-background md:static md:w-[340px] md:shrink-0">
           {rail === "comments" ? (
             <CommentsRail
               annotations={detail.annotations}
