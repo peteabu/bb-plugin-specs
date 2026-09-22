@@ -2452,7 +2452,7 @@ function SpecsWorkspace({
         ) : (
           <>
             <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
-              {chrome === "route" || selectedSlug === "" ? null : (
+              {chrome === "route" || showSidebar || selectedSlug === "" ? null : (
                 <IconButton label="All specs" onClick={() => onSelectSpec("")}>
                   <Icon name="ChevronLeft" className="size-4" />
                 </IconButton>
