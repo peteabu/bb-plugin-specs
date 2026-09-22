@@ -27,6 +27,13 @@ const ICONS: Record<string, ReactNode> = {
       <path d="M10 12h4" />
     </>
   ),
+  Beaker: (
+    <>
+      <path d="M9 3.5h6" />
+      <path d="M10 3.5v5.2L4.9 18a2 2 0 0 0 1.7 3h10.8a2 2 0 0 0 1.7-3L14 8.7V3.5" />
+      <path d="M7.2 14.5h9.6" />
+    </>
+  ),
   Check: <path d="M4.5 12.5 9.5 17.5 19.5 7" />,
   ChevronDown: <path d="m6 9.5 6 6 6-6" />,
   ChevronRight: <path d="m9.5 6 6 6-6 6" />,

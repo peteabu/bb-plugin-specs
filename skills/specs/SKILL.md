@@ -97,6 +97,28 @@ Decisions written under a `## Decisions` heading are listed read-only in the
 History view. Record new decisions through `specs_resolve` — prose decisions
 are labelled "not audited".
 
+## Proposals, decisions, and research
+
+- **People own the document.** With the default `agentWriteMode=propose`,
+  `specs_write` records a proposal the user reviews and applies (the UI shows a
+  diff with Apply / Reject). Link a proposal to the question it answers with
+  `questionId`; applying it then links the new revision to that decision and
+  records an `applied` event. Use `specs_propose` for edits you initiate and
+  `specs_write` when the user explicitly asked for the edit.
+- **Decisions are the record.** `specs_resolve`/`specs_dismiss` write an
+  attributed decision (decider, revision, rationale, accepted comments) that
+  survives later rewrites; `specs_decide` records one without a question and
+  `specs_decisions` lists them. Check `specs_decisions` before re-litigating.
+- **Research runs are durable.** `specs_research` starts a read-only
+  investigation; when it finishes the report is published as a child spec with
+  its own chat, questions, and decisions.
+- **Chat is context; `@agent` acts.** Messages posted to the spec discussion are
+  context for the next agent turn and do not start one. When a question is
+  dispatched or someone addresses the agent, reply in the thread with
+  `specs_reply` and record `specs_answer`/`specs_clarify`.
+- Agent-made revisions show a review banner in the UI with Keep / Revert, so a
+  direct write (or an applied proposal) is never silently accepted.
+
 ## Conventions
 
 - **Read before writing.** `specs_read` returns the current revision; use it as

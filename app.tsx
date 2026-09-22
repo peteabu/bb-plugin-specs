@@ -23,9 +23,13 @@ import {
 import { toast } from "sonner";
 import type {
   Annotation,
+  Decision,
   LinkMode,
   ProjectSummary,
+  Proposal,
+  Research,
   SpecDetail,
+  SpecMessage,
   SpecSummary,
   ThreadSpecsResult,
   ThreadSpecLink,
@@ -750,6 +754,272 @@ function PropertiesBar({
   );
 }
 
+interface DiffTarget {
+  specId: string;
+  title: string;
+  from: number;
+  to: number | null;
+  content?: string;
+}
+
+function DiffDialog({
+  target,
+  onOpenChange,
+}: {
+  target: DiffTarget | null;
+  onOpenChange: (open: boolean) => void;
+}) {
+  const rpc = useRpc<typeof rpcContract>();
+  const [rows, setRows] = useState<
+    Array<{ type: "same" | "add" | "del"; text: string }> | null
+  >(null);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (target === null) return;
+    setRows(null);
+    setError(null);
+    rpc
+      .call("specs_diff", {
+        id: target.specId,
+        from: target.from,
+        ...(target.to === null ? {} : { to: target.to }),
+        ...(target.content === undefined ? {} : { content: target.content }),
+      })
+      .then(
+        (result) => setRows(result.rows),
+        (cause: unknown) => setError(messageOf(cause)),
+      );
+  }, [target, rpc]);
+  return (
+    <Dialog open={target !== null} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-3xl rounded-2xl">
+        <DialogHeader>
+          <DialogTitle className="text-base">
+            {target === null
+              ? "Diff"
+              : `${target.title} · v${target.from} → ${target.to === null ? "proposal" : `v${target.to}`}`}
+          </DialogTitle>
+        </DialogHeader>
+        <div className="max-h-[60vh] overflow-auto rounded-xl border border-border bg-secondary/30">
+          {error !== null ? (
+            <p className="p-4 text-sm text-destructive">{error}</p>
+          ) : rows === null ? (
+            <p className="p-4 text-sm text-muted-foreground">Loading…</p>
+          ) : (
+            <div className="py-2 text-xs leading-relaxed">
+              {rows.map((row, index) => (
+                <div
+                  key={`${index}-${row.type}`}
+                  className={cn(
+                    "whitespace-pre-wrap px-3 font-mono",
+                    row.type === "add" && "bg-primary/10",
+                    row.type === "del" && "bg-destructive/10 text-muted-foreground",
+                    row.type === "same" && "text-muted-foreground",
+                  )}
+                >
+                  {row.type === "add" ? "+ " : row.type === "del" ? "- " : "  "}
+                  {row.text}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" onClick={() => onOpenChange(false)}>
+            Close
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function AgentChangeCard({
+  change,
+  busy,
+  onReview,
+  onKeep,
+  onRevert,
+}: {
+  change: NonNullable<SpecDetail["agentChange"]>;
+  busy: boolean;
+  onReview: () => void;
+  onKeep: () => void;
+  onRevert: () => void;
+}) {
+  if (change.acked) return null;
+  return (
+    <div className="specs-hairline mb-3 flex flex-wrap items-center gap-2 rounded-xl bg-card px-3 py-2.5">
+      <Icon name="Edit" className="size-3.5 text-primary" />
+      <span className="min-w-0 flex-1 text-sm">
+        The agent changed this spec in v{change.revision}.
+        {change.previousRevision === null
+          ? ""
+          : ` Keep it, or revert to v${change.previousRevision}.`}
+      </span>
+      <Button
+        size="sm"
+        variant="outline"
+        className="h-7 px-2.5"
+        onClick={onReview}
+      >
+        Review
+      </Button>
+      <Button
+        size="sm"
+        variant="ghost"
+        className="h-7 px-2.5"
+        disabled={busy}
+        onClick={onKeep}
+      >
+        Keep
+      </Button>
+      {change.previousRevision === null ? null : (
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 px-2.5 text-muted-foreground"
+          disabled={busy}
+          onClick={onRevert}
+        >
+          Revert
+        </Button>
+      )}
+    </div>
+  );
+}
+
+function ProposalCard({
+  proposal,
+  busy,
+  onReview,
+  onApply,
+  onReject,
+}: {
+  proposal: Proposal;
+  busy: boolean;
+  onReview: () => void;
+  onApply: () => void;
+  onReject: (note: string) => void;
+}) {
+  const [rejecting, setRejecting] = useState(false);
+  const [note, setNote] = useState("");
+  return (
+    <div className="specs-hairline mb-3 rounded-xl bg-card p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="rounded-md bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-primary">
+          Proposal
+        </span>
+        <span className="min-w-0 flex-1 truncate text-sm font-medium">
+          {proposal.note === "" ? "Agent proposed a change" : proposal.note}
+        </span>
+        <span className="text-[11px] text-muted-foreground tabular-nums">
+          written against v{proposal.baseRevision}
+        </span>
+      </div>
+      {proposal.questionId === null ? null : (
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Answers {proposal.questionId} — applying links the revision to its
+          decision.
+        </p>
+      )}
+      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        <Button
+          size="sm"
+          className="h-7 px-2.5"
+          disabled={busy}
+          onClick={onApply}
+        >
+          Apply
+        </Button>
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-7 px-2.5"
+          onClick={onReview}
+        >
+          Review diff
+        </Button>
+        {rejecting ? (
+          <span className="flex items-center gap-1.5">
+            <Input
+              value={note}
+              onChange={(event) => setNote(event.target.value)}
+              placeholder="Why? (optional)"
+              className="h-7 w-44 text-xs"
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 px-2"
+              disabled={busy}
+              onClick={() => onReject(note)}
+            >
+              Reject
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              className="h-7 px-2"
+              onClick={() => setRejecting(false)}
+            >
+              Cancel
+            </Button>
+          </span>
+        ) : (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2.5 text-muted-foreground"
+            onClick={() => setRejecting(true)}
+          >
+            Reject
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ResearchCard({
+  run,
+  onOpenRun,
+  onOpenResult,
+}: {
+  run: Research;
+  onOpenRun: () => void;
+  onOpenResult: () => void;
+}) {
+  return (
+    <div className="specs-hairline mb-3 flex flex-wrap items-center gap-2 rounded-xl bg-card px-3 py-2.5">
+      {run.status === "running" ? (
+        <Icon name="Loading" className="size-3.5 animate-spin text-primary" />
+      ) : (
+        <Icon name="Beaker" className="size-3.5 text-muted-foreground" />
+      )}
+      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground tabular-nums">
+        Research · {run.status}
+      </span>
+      <span className="min-w-0 flex-1 truncate text-sm">{run.brief}</span>
+      {run.status === "running" ? (
+        <Button size="sm" variant="outline" className="h-7 px-2.5" onClick={onOpenRun}>
+          Open run
+        </Button>
+      ) : null}
+      {run.status === "failed" ? (
+        <span className="text-[11px] text-destructive">
+          {truncate(run.error, 120)}
+        </span>
+      ) : null}
+      {run.resultSpecId === null ? null : (
+        <Button size="sm" className="h-7 px-2.5" onClick={onOpenResult}>
+          Open result
+        </Button>
+      )}
+    </div>
+  );
+}
+
 function EmojiPickerDialog({
   open,
   current,
@@ -1180,6 +1450,7 @@ function CommentCard({
 
 function CommentsRail({
   annotations,
+  decisions,
   textQuestions,
   textDecisions,
   onClose,
@@ -1195,6 +1466,7 @@ function CommentsRail({
   onPromote,
 }: {
   annotations: Annotation[];
+  decisions: Decision[];
   textQuestions: Array<{ text: string; source: "section" | "marker" }>;
   textDecisions: string[];
   onClose: () => void;
@@ -1301,7 +1573,8 @@ function CommentsRail({
 
         {shown.length === 0 &&
         !(filter === "open" && textQuestions.length > 0) &&
-        !(filter === "history" && textDecisions.length > 0) ? (
+        !(filter === "history" && textDecisions.length > 0) &&
+        !(filter === "history" && decisions.length > 0) ? (
           <div className="pt-6">
             <EmptyState>
               {filter === "open"
@@ -1328,6 +1601,54 @@ function CommentsRail({
             />
           ))
         )}
+
+        {filter === "history" && decisions.length > 0 ? (
+          <div className="specs-hairline rounded-xl bg-card p-3">
+            <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Decision log ({decisions.length})
+            </p>
+            <ul className="mt-2 space-y-3">
+              {decisions.map((decision) => (
+                <li key={decision.id}>
+                  <div className="flex items-center gap-2">
+                    <Avatar name={decision.decidedBy} />
+                    <span className="text-xs font-medium">
+                      {displayAuthor(decision.decidedBy)}
+                    </span>
+                    <span className="text-[11px] text-muted-foreground tabular-nums">
+                      {relativeTime(decision.createdAt)}
+                      {decision.revision === null ? "" : ` · v${decision.revision}`}
+                    </span>
+                    {decision.status === "dismissed" ? (
+                      <span className="text-[10px] uppercase text-muted-foreground">
+                        dismissed
+                      </span>
+                    ) : null}
+                  </div>
+                  <div className="mt-1 text-sm leading-relaxed">
+                    <Markdown content={decision.decision} />
+                  </div>
+                  {decision.rationale === "" ? null : (
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      Rationale: {truncate(decision.rationale, 240)}
+                    </p>
+                  )}
+                  {decision.questionId === null ? null : (
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">
+                      From {decision.questionId}
+                    </p>
+                  )}
+                  {decision.acceptedComments.length === 0 ? null : (
+                    <p className="mt-0.5 text-[11px] text-muted-foreground">
+                      {decision.acceptedComments.length} accepted comment
+                      {decision.acceptedComments.length === 1 ? "" : "s"}
+                    </p>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
 
         {filter === "history" && textDecisions.length > 0 ? (
           <div className="specs-hairline rounded-xl bg-card p-3">
@@ -1385,6 +1706,13 @@ function SpecsPage({ subPath }: { subPath: string }) {
     null,
   );
   const [chatBusy, setChatBusy] = useState(false);
+  const [chatText, setChatText] = useState("");
+  const [proposalBusy, setProposalBusy] = useState(false);
+  const [changeBusy, setChangeBusy] = useState(false);
+  const [diffTarget, setDiffTarget] = useState<DiffTarget | null>(null);
+  const [researchOpen, setResearchOpen] = useState(false);
+  const [researchBrief, setResearchBrief] = useState("");
+  const [researchBusy, setResearchBusy] = useState(false);
   const previewRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const detailRef = useRef<SpecDetail | null>(null);
@@ -1725,6 +2053,132 @@ function SpecsPage({ subPath }: { subPath: string }) {
     }
   };
 
+  const postDiscussion = async () => {
+    const value = chatText.trim();
+    if (detail === null || value === "" || chatBusy) return;
+    setChatBusy(true);
+    try {
+      await rpc.call("discussion_post", { specId: detail.spec.id, body: value });
+      setChatText("");
+      refetchDetail(selectedSlug);
+    } catch (cause) {
+      toast.error(messageOf(cause));
+    } finally {
+      setChatBusy(false);
+    }
+  };
+
+  const askAgentChat = async () => {
+    const raw = chatText.trim();
+    if (detail === null || raw === "" || chatBusy) return;
+    const value = raw.toLowerCase().startsWith("@agent")
+      ? raw.slice(6).trim()
+      : raw;
+    if (value === "") return;
+    setChatBusy(true);
+    try {
+      await rpc.call("chat_ask", { specId: detail.spec.id, text: value });
+      setChatText("");
+      toast.success("Sent to the agent");
+      refetchDetail(selectedSlug);
+    } catch (cause) {
+      toast.error(messageOf(cause));
+    } finally {
+      setChatBusy(false);
+    }
+  };
+
+  const sendChat = async () => {
+    const value = chatText.trim();
+    if (value === "") return;
+    if (value.toLowerCase().startsWith("@agent")) {
+      await askAgentChat();
+      return;
+    }
+    await postDiscussion();
+  };
+
+  const applyProposal = async (proposalId: string) => {
+    if (proposalBusy) return;
+    setProposalBusy(true);
+    try {
+      const result = await rpc.call("proposals_apply", { proposalId });
+      toast.success(`Applied as v${result.revision}`);
+      refetchList();
+      refetchDetail(selectedSlug);
+    } catch (cause) {
+      toast.error(messageOf(cause));
+      refetchDetail(selectedSlug);
+    } finally {
+      setProposalBusy(false);
+    }
+  };
+
+  const rejectProposal = async (proposalId: string, note: string) => {
+    if (proposalBusy) return;
+    setProposalBusy(true);
+    try {
+      await rpc.call("proposals_reject", { proposalId, note });
+      toast.success("Proposal rejected");
+      refetchDetail(selectedSlug);
+    } catch (cause) {
+      toast.error(messageOf(cause));
+    } finally {
+      setProposalBusy(false);
+    }
+  };
+
+  const ackChange = async (revision: number) => {
+    if (detail === null || changeBusy) return;
+    setChangeBusy(true);
+    try {
+      await rpc.call("specs_ack_agent_change", {
+        id: detail.spec.id,
+        revision,
+      });
+      refetchDetail(selectedSlug);
+    } catch (cause) {
+      toast.error(messageOf(cause));
+    } finally {
+      setChangeBusy(false);
+    }
+  };
+
+  const revertChange = async (toRevision: number) => {
+    if (detail === null || changeBusy) return;
+    setChangeBusy(true);
+    try {
+      const result = await rpc.call("specs_revert", {
+        id: detail.spec.id,
+        toRevision,
+      });
+      toast.success(`Reverted to v${toRevision}'s content (new v${result.revision})`);
+      refetchList();
+      refetchDetail(selectedSlug);
+    } catch (cause) {
+      toast.error(messageOf(cause));
+    } finally {
+      setChangeBusy(false);
+    }
+  };
+
+  const startResearch = async () => {
+    const brief = researchBrief.trim();
+    if (detail === null || brief === "" || researchBusy) return;
+    setResearchBusy(true);
+    try {
+      await rpc.call("research_start", { specId: detail.spec.id, brief });
+      setResearchOpen(false);
+      setResearchBrief("");
+      toast.success("Research started — the report lands as a child spec");
+      refetchDetail(selectedSlug);
+    } catch (cause) {
+      toast.error(messageOf(cause));
+    } finally {
+      setResearchBusy(false);
+    }
+  };
+
   const submitAnnotation = async () => {
     if (detail === null || annotationDraft === null) return;
     const body = annotationDraft.body.trim();
@@ -1951,6 +2405,12 @@ function SpecsPage({ subPath }: { subPath: string }) {
                     <Icon name="Edit" className="size-4" />
                   </IconButton>
                   <IconButton
+                    label="Run research"
+                    onClick={() => setResearchOpen(true)}
+                  >
+                    <Icon name="Beaker" className="size-4" />
+                  </IconButton>
+                  <IconButton
                     label="Delete spec"
                     onClick={() => setDeleteOpen(true)}
                   >
@@ -2053,6 +2513,71 @@ function SpecsPage({ subPath }: { subPath: string }) {
                   onStatus={(next) => void setStatus(next)}
                 />
 
+                {detail.agentChange === null &&
+                detail.proposals.length === 0 &&
+                detail.research.length === 0 ? null : (
+                  <div className="mt-4">
+                    {detail.agentChange === null ? null : (
+                      <AgentChangeCard
+                        change={detail.agentChange}
+                        busy={changeBusy}
+                        onReview={() =>
+                          setDiffTarget({
+                            specId: detail.spec.id,
+                            title: detail.spec.title,
+                            from:
+                              detail.agentChange?.previousRevision ??
+                              detail.agentChange?.revision ??
+                              1,
+                            to: detail.agentChange?.revision ?? null,
+                          })
+                        }
+                        onKeep={() =>
+                          void ackChange(detail.agentChange?.revision ?? 0)
+                        }
+                        onRevert={() =>
+                          void revertChange(
+                            detail.agentChange?.previousRevision ?? 1,
+                          )
+                        }
+                      />
+                    )}
+                    {detail.proposals.map((proposal) => (
+                      <ProposalCard
+                        key={proposal.id}
+                        proposal={proposal}
+                        busy={proposalBusy}
+                        onReview={() =>
+                          setDiffTarget({
+                            specId: detail.spec.id,
+                            title:
+                              proposal.note === ""
+                                ? detail.spec.title
+                                : proposal.note,
+                            from: proposal.baseRevision,
+                            to: null,
+                            content: proposal.content,
+                          })
+                        }
+                        onApply={() => void applyProposal(proposal.id)}
+                        onReject={(note) => void rejectProposal(proposal.id, note)}
+                      />
+                    ))}
+                    {detail.research.slice(0, 3).map((run) => (
+                      <ResearchCard
+                        key={run.id}
+                        run={run}
+                        onOpenRun={() => navigate.toThread(run.threadId)}
+                        onOpenResult={() => {
+                          if (run.resultSpecId !== null) {
+                            selectSpec(run.resultSpecId);
+                          }
+                        }}
+                      />
+                    ))}
+                  </div>
+                )}
+
                 <div className="mt-6 border-t border-border pt-6">
                   {editing ? (
                     <textarea
@@ -2100,6 +2625,7 @@ function SpecsPage({ subPath }: { subPath: string }) {
           {rail === "comments" ? (
             <CommentsRail
               annotations={detail.annotations}
+              decisions={detail.decisions}
               textQuestions={detail.textQuestions}
               textDecisions={detail.textDecisions}
               onClose={() => setRailAndNavigate("none")}
@@ -2232,9 +2758,71 @@ function SpecsPage({ subPath }: { subPath: string }) {
               <div className="min-h-0 flex-1">
                 <ThreadChat
                   threadId={detail.chatThreadId}
-                  variant="compact"
+                  variant="timeline"
                   className="h-full"
                 />
+              </div>
+              <div className="shrink-0 border-t border-border p-3">
+                {detail.discussion.length === 0 ? null : (
+                  <div className="specs-scroll max-h-32 space-y-1.5 overflow-y-auto pb-1">
+                    {detail.discussion.slice(-8).map((message) => (
+                      <div key={message.id} className="text-xs leading-relaxed">
+                        <span className="font-medium">
+                          {displayAuthor(message.author)}
+                        </span>
+                        <span className="ml-1.5 text-[10px] text-muted-foreground tabular-nums">
+                          {relativeTime(message.createdAt)}
+                        </span>
+                        <p
+                          className={cn(
+                            "text-foreground/90",
+                            message.consumedAt === null
+                              ? undefined
+                              : "text-muted-foreground",
+                          )}
+                        >
+                          {truncate(message.body, 300)}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <textarea
+                  value={chatText}
+                  onChange={(event) => setChatText(event.target.value)}
+                  placeholder="Discuss — or start with @agent to run the agent…"
+                  className={cn(textareaClassName, "mt-2 h-16 rounded-xl text-sm")}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      void sendChat();
+                    }
+                  }}
+                />
+                <div className="mt-1.5 flex items-center justify-between gap-2">
+                  <span className="text-[10px] text-muted-foreground">
+                    Posts are context; only @agent runs the agent.
+                  </span>
+                  <span className="flex shrink-0 gap-1.5">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      className="h-7 px-2"
+                      disabled={chatBusy || chatText.trim() === ""}
+                      onClick={() => void postDiscussion()}
+                    >
+                      Post
+                    </Button>
+                    <Button
+                      size="sm"
+                      className="h-7 px-2.5"
+                      disabled={chatBusy || chatText.trim() === ""}
+                      onClick={() => void askAgentChat()}
+                    >
+                      Ask agent
+                    </Button>
+                  </span>
+                </div>
               </div>
             </div>
           )}
@@ -2397,6 +2985,50 @@ function SpecsPage({ subPath }: { subPath: string }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <Dialog open={researchOpen} onOpenChange={setResearchOpen}>
+        <DialogContent className="max-w-lg rounded-2xl">
+          <DialogHeader>
+            <DialogTitle className="text-base">Run research</DialogTitle>
+          </DialogHeader>
+          <textarea
+            autoFocus
+            value={researchBrief}
+            onChange={(event) => setResearchBrief(event.target.value)}
+            placeholder="What should the agent investigate? e.g. compare the two export formats and recommend one."
+            className={cn(textareaClassName, "h-24 rounded-xl")}
+            onKeyDown={(event) => {
+              if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                event.preventDefault();
+                void startResearch();
+              }
+            }}
+          />
+          <p className="text-xs text-muted-foreground">
+            A background agent investigates read-only and publishes the report as
+            a child spec with its own questions and decisions. Progress shows at
+            the top of this page.
+          </p>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setResearchOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              disabled={researchBusy || researchBrief.trim() === ""}
+              onClick={() => void startResearch()}
+            >
+              {researchBusy ? "Starting…" : "Start research"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <DiffDialog
+        target={diffTarget}
+        onOpenChange={(open) => {
+          if (!open) setDiffTarget(null);
+        }}
+      />
 
       <EmojiPickerDialog
         open={emojiOpen}

@@ -47,7 +47,7 @@ export type AnnotationComment = z.infer<typeof commentSchema>;
 
 const questionEventSchema = z.object({
   id: z.string(),
-  event: z.enum(["asked", "answered", "clarified", "resolved", "dismissed", "reopened"]),
+  event: z.enum(["asked", "answered", "clarified", "resolved", "dismissed", "reopened", "applied"]),
   actor: z.string(),
   note: z.string(),
   revision: z.number().int().nullable(),
@@ -85,6 +85,67 @@ export type Annotation = z.infer<typeof annotationSchema>;
 const linkModeSchema = z.enum(["pinned", "auto", "available"]);
 export type LinkMode = z.infer<typeof linkModeSchema>;
 
+const proposalSchema = z.object({
+  id: z.string(),
+  specId: z.string(),
+  baseRevision: z.number().int(),
+  title: z.string(),
+  summary: z.string(),
+  content: z.string(),
+  note: z.string(),
+  author: z.string(),
+  questionId: z.string().nullable(),
+  status: z.enum(["pending", "applied", "rejected", "superseded"]),
+  resolutionNote: z.string(),
+  resolvedBy: z.string(),
+  resolvedAt: z.string().nullable(),
+  appliedRevision: z.number().int().nullable(),
+  createdAt: z.string(),
+});
+export type Proposal = z.infer<typeof proposalSchema>;
+
+const decisionSchema = z.object({
+  id: z.string(),
+  specId: z.string(),
+  questionId: z.string().nullable(),
+  decision: z.string(),
+  rationale: z.string(),
+  decidedBy: z.string(),
+  revision: z.number().int().nullable(),
+  acceptedComments: z.array(commentSchema),
+  status: z.enum(["decided", "dismissed"]),
+  createdAt: z.string(),
+});
+export type Decision = z.infer<typeof decisionSchema>;
+
+const researchSchema = z.object({
+  id: z.string(),
+  specId: z.string(),
+  brief: z.string(),
+  threadId: z.string(),
+  status: z.enum(["running", "done", "failed", "cancelled"]),
+  resultSpecId: z.string().nullable(),
+  error: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Research = z.infer<typeof researchSchema>;
+
+const specMessageSchema = z.object({
+  id: z.string(),
+  specId: z.string(),
+  author: z.string(),
+  body: z.string(),
+  consumedAt: z.string().nullable(),
+  createdAt: z.string(),
+});
+export type SpecMessage = z.infer<typeof specMessageSchema>;
+
+const diffRowSchema = z.object({
+  type: z.enum(["same", "add", "del"]),
+  text: z.string(),
+});
+
 const threadLinkModeSchema = z.enum([
   "attached",
   "detached",
@@ -116,6 +177,16 @@ export type SpecDetail = {
   chatThreadId: string | null;
   textQuestions: Array<{ text: string; source: "section" | "marker" }>;
   textDecisions: string[];
+  proposals: Proposal[];
+  decisions: Decision[];
+  research: Research[];
+  discussion: SpecMessage[];
+  agentChange: {
+    revision: number;
+    author: string;
+    acked: boolean;
+    previousRevision: number | null;
+  } | null;
 };
 export type ThreadSpecsResult = {
   specs: ThreadSpecLink[];
@@ -149,6 +220,18 @@ export const rpcContract = defineRpcContract({
         }),
       ),
       textDecisions: z.array(z.string()),
+      proposals: z.array(proposalSchema),
+      decisions: z.array(decisionSchema),
+      research: z.array(researchSchema),
+      discussion: z.array(specMessageSchema),
+      agentChange: z
+        .object({
+          revision: z.number().int(),
+          author: z.string(),
+          acked: z.boolean(),
+          previousRevision: z.number().int().nullable(),
+        })
+        .nullable(),
     }),
   },
   specs_create: {
@@ -248,6 +331,68 @@ export const rpcContract = defineRpcContract({
       revision: z.number().int(),
     }),
   },
+  proposals_apply: {
+    input: z.object({ proposalId: z.string() }),
+    output: z.object({ revision: z.number().int() }),
+  },
+  proposals_reject: {
+    input: z.object({
+      proposalId: z.string(),
+      note: z.string().max(2000).optional(),
+    }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  specs_diff: {
+    input: z.object({
+      id: z.string(),
+      from: z.number().int(),
+      to: z.number().int().optional(),
+      content: z.string().optional(),
+    }),
+    output: z.object({
+      from: z.number().int(),
+      to: z.number().int().nullable(),
+      truncated: z.boolean(),
+      rows: z.array(diffRowSchema),
+    }),
+  },
+  specs_ack_agent_change: {
+    input: z.object({ id: z.string(), revision: z.number().int() }),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  specs_revert: {
+    input: z.object({ id: z.string(), toRevision: z.number().int() }),
+    output: z.object({ revision: z.number().int() }),
+  },
+  research_start: {
+    input: z.object({
+      specId: z.string(),
+      brief: z.string().trim().min(1).max(2000),
+    }),
+    output: z.object({ researchId: z.string(), threadId: z.string() }),
+  },
+  discussion_post: {
+    input: z.object({
+      specId: z.string(),
+      body: z.string().trim().min(1).max(5000),
+    }),
+    output: z.object({ id: z.string() }),
+  },
+  chat_ask: {
+    input: z.object({
+      specId: z.string(),
+      text: z.string().trim().min(1).max(5000),
+    }),
+    output: z.object({ ok: z.literal(true), threadId: z.string() }),
+  },
+  decisions_list: {
+    input: z.object({
+      projectId: z.string().nullable().optional(),
+      specId: z.string().optional(),
+      limit: z.number().int().min(1).max(200).optional(),
+    }),
+    output: z.object({ decisions: z.array(decisionSchema) }),
+  },
   annotations_comment: {
     input: z.object({
       annotationId: z.string(),
@@ -301,8 +446,62 @@ interface SpecRecord {
   icon: string;
   status: "active" | "archived";
   revision: number;
+  acked_revision: number | null;
+  parent_spec_id: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface ProposalRecord {
+  id: string;
+  spec_id: string;
+  base_revision: number;
+  title: string;
+  summary: string;
+  content: string;
+  note: string;
+  author: string;
+  question_id: string | null;
+  status: "pending" | "applied" | "rejected" | "superseded";
+  resolution_note: string;
+  resolved_by: string;
+  resolved_at: string | null;
+  applied_revision: number | null;
+  created_at: string;
+}
+
+interface DecisionRecord {
+  id: string;
+  spec_id: string;
+  question_id: string | null;
+  decision: string;
+  rationale: string;
+  decided_by: string;
+  revision: number | null;
+  accepted_comments: string;
+  status: "decided" | "dismissed";
+  created_at: string;
+}
+
+interface ResearchRecord {
+  id: string;
+  spec_id: string;
+  brief: string;
+  thread_id: string;
+  status: "running" | "done" | "failed" | "cancelled";
+  result_spec_id: string | null;
+  error: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface SpecMessageRecord {
+  id: string;
+  spec_id: string;
+  author: string;
+  body: string;
+  consumed_at: string | null;
+  created_at: string;
 }
 
 interface AnnotationRecord {
@@ -333,7 +532,7 @@ interface QuestionEventRecord {
   id: string;
   question_id: string;
   spec_id: string;
-  event: "asked" | "answered" | "clarified" | "resolved" | "dismissed" | "reopened";
+  event: "asked" | "answered" | "clarified" | "resolved" | "dismissed" | "reopened" | "applied";
   actor: string;
   note: string;
   revision: number | null;
@@ -518,6 +717,12 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Send new questions to the spec's agent thread",
       default: true,
     },
+    agentWriteMode: {
+      type: "select",
+      label: "Agent spec edits",
+      options: ["propose", "direct"],
+      default: "propose",
+    },
   });
   let config = await settings.get();
   settings.onChange((next) => {
@@ -618,6 +823,60 @@ export default async function plugin(bb: BbPluginApi) {
     )`,
     `CREATE INDEX IF NOT EXISTS question_events_spec_idx ON question_events(spec_id)`,
     `ALTER TABLE annotations ADD COLUMN dispatched_at TEXT`,
+    `CREATE TABLE IF NOT EXISTS proposals (
+      id TEXT PRIMARY KEY,
+      spec_id TEXT NOT NULL,
+      base_revision INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL DEFAULT '',
+      content TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+      author TEXT NOT NULL,
+      question_id TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      resolution_note TEXT NOT NULL DEFAULT '',
+      resolved_by TEXT NOT NULL DEFAULT '',
+      resolved_at TEXT,
+      applied_revision INTEGER,
+      created_at TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS proposals_spec_idx ON proposals(spec_id, status)`,
+    `CREATE TABLE IF NOT EXISTS decisions (
+      id TEXT PRIMARY KEY,
+      spec_id TEXT NOT NULL,
+      question_id TEXT,
+      decision TEXT NOT NULL,
+      rationale TEXT NOT NULL DEFAULT '',
+      decided_by TEXT NOT NULL,
+      revision INTEGER,
+      accepted_comments TEXT NOT NULL DEFAULT '[]',
+      status TEXT NOT NULL DEFAULT 'decided',
+      created_at TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS decisions_spec_idx ON decisions(spec_id)`,
+    `CREATE TABLE IF NOT EXISTS research (
+      id TEXT PRIMARY KEY,
+      spec_id TEXT NOT NULL,
+      brief TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      result_spec_id TEXT,
+      error TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS research_spec_idx ON research(spec_id)`,
+    `CREATE TABLE IF NOT EXISTS spec_messages (
+      id TEXT PRIMARY KEY,
+      spec_id TEXT NOT NULL,
+      author TEXT NOT NULL,
+      body TEXT NOT NULL,
+      consumed_at TEXT,
+      created_at TEXT NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS spec_messages_spec_idx ON spec_messages(spec_id)`,
+    `ALTER TABLE specs ADD COLUMN acked_revision INTEGER`,
+    `ALTER TABLE specs ADD COLUMN parent_spec_id TEXT`,
   ]);
 
   // ---- project name cache (sync digest needs names without async sdk calls) --
@@ -951,6 +1210,16 @@ export default async function plugin(bb: BbPluginApi) {
       decision,
       foldedRevision ?? null,
     );
+    recordDecision({
+      specId: question.spec_id,
+      questionId: question.id,
+      decision,
+      rationale: question.answer,
+      decidedBy: actor,
+      revision: foldedRevision ?? findSpecById(question.spec_id)?.revision ?? null,
+      acceptedComments: commentsOf(question.id),
+      status: "decided",
+    });
     publishChanged(question.spec_id, "question-resolved");
     return mustFindQuestion(annotationId);
   }
@@ -966,6 +1235,16 @@ export default async function plugin(bb: BbPluginApi) {
       `UPDATE annotations SET state = 'dismissed', status = 'resolved', decision = ?, resolved_by = ?, resolved_at = ?, updated_at = ? WHERE id = ?`,
     ).run(reason, actor, timestamp, timestamp, annotationId);
     recordQuestionEvent(annotationId, question.spec_id, "dismissed", actor, reason);
+    recordDecision({
+      specId: question.spec_id,
+      questionId: question.id,
+      decision: reason === "" ? "Dismissed without a decision" : reason,
+      rationale: question.answer,
+      decidedBy: actor,
+      revision: findSpecById(question.spec_id)?.revision ?? null,
+      acceptedComments: commentsOf(question.id),
+      status: "dismissed",
+    });
     publishChanged(question.spec_id, "question-dismissed");
     return mustFindQuestion(annotationId);
   }
@@ -1017,6 +1296,7 @@ export default async function plugin(bb: BbPluginApi) {
     content?: string;
     icon?: string;
     projectIds?: string[];
+    parentSpecId?: string;
     author: string;
     mode?: LinkMode;
   }): SpecRecord {
@@ -1032,13 +1312,15 @@ export default async function plugin(bb: BbPluginApi) {
       icon: input.icon?.trim() === "" ? "📄" : (input.icon?.trim() ?? "📄"),
       status: "active",
       revision: 1,
+      acked_revision: null,
+      parent_spec_id: input.parentSpecId ?? null,
       created_at: timestamp,
       updated_at: timestamp,
     };
     const insert = db.transaction(() => {
       db.prepare(
-        `INSERT INTO specs (id, slug, title, summary, content, icon, status, revision, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO specs (id, slug, title, summary, content, icon, status, revision, parent_spec_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         record.id,
         record.slug,
@@ -1048,6 +1330,7 @@ export default async function plugin(bb: BbPluginApi) {
         record.icon,
         record.status,
         record.revision,
+        record.parent_spec_id,
         record.created_at,
         record.updated_at,
       );
@@ -1339,6 +1622,7 @@ export default async function plugin(bb: BbPluginApi) {
         "SELECT * FROM annotation_comments WHERE annotation_id = ? ORDER BY created_at ASC",
       )
       .all(question.id) as CommentRecord[];
+    const context = discussionContextFor(spec.id);
     const message = [
       `This thread is the discussion thread for spec "${spec.title}" (slug "${spec.slug}").`,
       trigger === "asked"
@@ -1361,10 +1645,11 @@ export default async function plugin(bb: BbPluginApi) {
                   `- ${comment.author}: ${truncate(comment.body, 200)}`,
               ),
           ]),
+      ...(context === "" ? [] : ["", context]),
       "",
       `Reply IN the question's thread with specs_reply({ annotationId: "${question.id}", body }) so the user sees it where they asked.`,
       "If the spec and project context settle it, record specs_answer as well; if it is underspecified, use specs_clarify with one sharp follow-up.",
-      "Do not edit the spec unless the question asks for it.",
+      "Do not edit the spec directly: when the question implies a change, create a proposal with specs_propose and resolve with the decision.",
     ].join("\n");
     try {
       const chat = await ensureChatThread(spec, message);
@@ -1375,6 +1660,7 @@ export default async function plugin(bb: BbPluginApi) {
           input: [{ type: "text", text: message, mentions: [] }],
         });
       }
+      consumeDiscussion(spec.id);
       db.prepare("UPDATE annotations SET dispatched_at = ? WHERE id = ?").run(
         nowIso(),
         question.id,
@@ -1422,6 +1708,641 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     return { id };
+  }
+
+  // ---- proposals: agent edits the user applies -----------------------------
+
+  function proposalFrom(row: ProposalRecord): Proposal {
+    return {
+      id: row.id,
+      specId: row.spec_id,
+      baseRevision: row.base_revision,
+      title: row.title,
+      summary: row.summary,
+      content: row.content,
+      note: row.note,
+      author: row.author,
+      questionId: row.question_id,
+      status: row.status,
+      resolutionNote: row.resolution_note,
+      resolvedBy: row.resolved_by,
+      resolvedAt: row.resolved_at,
+      appliedRevision: row.applied_revision,
+      createdAt: row.created_at,
+    };
+  }
+
+  function proposalsFor(specId: string): Proposal[] {
+    const rows = db
+      .prepare(
+        "SELECT * FROM proposals WHERE spec_id = ? ORDER BY created_at DESC LIMIT 50",
+      )
+      .all(specId) as ProposalRecord[];
+    return rows.map(proposalFrom);
+  }
+
+  function createProposal(input: {
+    specId: string;
+    content: string;
+    title?: string;
+    summary?: string;
+    note?: string;
+    author: string;
+    questionId?: string;
+  }): ProposalRecord {
+    const spec = findSpecById(input.specId);
+    if (spec === undefined) throw new Error(`No spec with id ${input.specId}.`);
+    assertContentSize(input.content);
+    const record: ProposalRecord = {
+      id: `prop_${randomUUID().slice(0, 8)}`,
+      spec_id: spec.id,
+      base_revision: spec.revision,
+      title: input.title?.trim() ?? spec.title,
+      summary: input.summary?.trim() ?? spec.summary,
+      content: input.content,
+      note: input.note?.trim() ?? "",
+      author: input.author,
+      question_id: input.questionId ?? null,
+      status: "pending",
+      resolution_note: "",
+      resolved_by: "",
+      resolved_at: null,
+      applied_revision: null,
+      created_at: nowIso(),
+    };
+    db.prepare(
+      `INSERT INTO proposals (id, spec_id, base_revision, title, summary, content, note, author, question_id, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+    ).run(
+      record.id,
+      record.spec_id,
+      record.base_revision,
+      record.title,
+      record.summary,
+      record.content,
+      record.note,
+      record.author,
+      record.question_id,
+      record.created_at,
+    );
+    publishChanged(spec.id, "proposal-created");
+    return record;
+  }
+
+  function applyProposal(
+    proposalId: string,
+    actor: string,
+  ): { revision: number } {
+    const row = db
+      .prepare("SELECT * FROM proposals WHERE id = ?")
+      .get(proposalId) as ProposalRecord | undefined;
+    if (row === undefined) throw new Error(`No proposal with id ${proposalId}.`);
+    if (row.status !== "pending") {
+      throw new Error(`Proposal ${proposalId} is ${row.status}.`);
+    }
+    const spec = findSpecById(row.spec_id);
+    if (spec === undefined) throw new Error(`No spec with id ${row.spec_id}.`);
+    if (spec.revision !== row.base_revision) {
+      db.prepare(
+        "UPDATE proposals SET status = 'superseded', resolved_at = ?, resolution_note = ? WHERE id = ?",
+      ).run(nowIso(), `Spec moved to v${spec.revision}`, proposalId);
+      publishChanged(spec.id, "proposal-superseded");
+      throw new Error(
+        `Proposal is stale: the spec is at v${spec.revision} but this proposal was written against v${row.base_revision}. Ask the agent to re-propose against the current revision.`,
+      );
+    }
+    const updated = saveSpec({
+      id: spec.id,
+      content: row.content,
+      title: row.title === "" ? undefined : row.title,
+      summary: row.summary,
+      author: actor,
+    });
+    db.prepare(
+      "UPDATE proposals SET status = 'applied', resolved_by = ?, resolved_at = ?, applied_revision = ? WHERE id = ?",
+    ).run(actor, nowIso(), updated.revision, proposalId);
+    if (row.question_id !== null) {
+      const question = annotationById(row.question_id);
+      if (question !== undefined) {
+        db.prepare(
+          "UPDATE annotations SET folded_revision = ?, updated_at = ? WHERE id = ?",
+        ).run(updated.revision, nowIso(), question.id);
+        db.prepare("UPDATE decisions SET revision = ? WHERE question_id = ?").run(
+          updated.revision,
+          question.id,
+        );
+        recordQuestionEvent(
+          question.id,
+          spec.id,
+          "applied",
+          actor,
+          `Decision applied in v${updated.revision}`,
+          updated.revision,
+        );
+      }
+    }
+    publishChanged(spec.id, "proposal-applied");
+    return { revision: updated.revision };
+  }
+
+  function rejectProposal(
+    proposalId: string,
+    note: string,
+    actor: string,
+  ): void {
+    const row = db
+      .prepare("SELECT * FROM proposals WHERE id = ?")
+      .get(proposalId) as ProposalRecord | undefined;
+    if (row === undefined) throw new Error(`No proposal with id ${proposalId}.`);
+    if (row.status !== "pending") {
+      throw new Error(`Proposal ${proposalId} is ${row.status}.`);
+    }
+    db.prepare(
+      "UPDATE proposals SET status = 'rejected', resolution_note = ?, resolved_by = ?, resolved_at = ? WHERE id = ?",
+    ).run(note, actor, nowIso(), proposalId);
+    publishChanged(row.spec_id, "proposal-rejected");
+  }
+
+  // ---- decisions: the attributed record, separate from the prose -----------
+
+  function decisionFrom(row: DecisionRecord): Decision {
+    let accepted: AnnotationComment[] = [];
+    try {
+      const parsed: unknown = JSON.parse(row.accepted_comments);
+      if (Array.isArray(parsed)) {
+        accepted = parsed
+          .filter(
+            (entry): entry is AnnotationComment =>
+              typeof entry === "object" &&
+              entry !== null &&
+              typeof (entry as AnnotationComment).body === "string",
+          )
+          .slice(0, 20);
+      }
+    } catch {
+      accepted = [];
+    }
+    return {
+      id: row.id,
+      specId: row.spec_id,
+      questionId: row.question_id,
+      decision: row.decision,
+      rationale: row.rationale,
+      decidedBy: row.decided_by,
+      revision: row.revision,
+      acceptedComments: accepted,
+      status: row.status,
+      createdAt: row.created_at,
+    };
+  }
+
+  function decisionsFor(options: {
+    specId?: string;
+    projectId?: string | null;
+    limit?: number;
+  }): Decision[] {
+    const clauses: string[] = [];
+    const params: unknown[] = [];
+    if (options.specId !== undefined) {
+      clauses.push("d.spec_id = ?");
+      params.push(options.specId);
+    }
+    if (options.projectId != null) {
+      clauses.push(
+        "EXISTS (SELECT 1 FROM spec_projects p WHERE p.spec_id = d.spec_id AND p.project_id = ?)",
+      );
+      params.push(options.projectId);
+    }
+    const where = clauses.length === 0 ? "" : `WHERE ${clauses.join(" AND ")}`;
+    const rows = db
+      .prepare(
+        `SELECT d.* FROM decisions d ${where} ORDER BY d.created_at DESC LIMIT ?`,
+      )
+      .all(...params, options.limit ?? 100) as DecisionRecord[];
+    return rows.map(decisionFrom);
+  }
+
+  function recordDecision(input: {
+    specId: string;
+    questionId: string | null;
+    decision: string;
+    rationale: string;
+    decidedBy: string;
+    revision: number | null;
+    acceptedComments: AnnotationComment[];
+    status: "decided" | "dismissed";
+  }): void {
+    if (input.questionId !== null) {
+      db.prepare("DELETE FROM decisions WHERE question_id = ?").run(
+        input.questionId,
+      );
+    }
+    db.prepare(
+      `INSERT INTO decisions (id, spec_id, question_id, decision, rationale, decided_by, revision, accepted_comments, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      `dec_${randomUUID().slice(0, 8)}`,
+      input.specId,
+      input.questionId,
+      input.decision,
+      input.rationale,
+      input.decidedBy,
+      input.revision,
+      JSON.stringify(input.acceptedComments.slice(0, 20)),
+      input.status,
+      nowIso(),
+    );
+  }
+
+  function commentsOf(annotationId: string): AnnotationComment[] {
+    const rows = db
+      .prepare(
+        "SELECT * FROM annotation_comments WHERE annotation_id = ? ORDER BY created_at ASC",
+      )
+      .all(annotationId) as CommentRecord[];
+    return rows.map((row) => ({
+      id: row.id,
+      body: row.body,
+      author: row.author,
+      createdAt: row.created_at,
+    }));
+  }
+
+  function addStandaloneDecision(input: {
+    specId: string;
+    decision: string;
+    rationale?: string;
+    actor: string;
+    revision?: number;
+  }): Decision {
+    const spec = findSpecById(input.specId);
+    if (spec === undefined) throw new Error(`No spec with id ${input.specId}.`);
+    recordDecision({
+      specId: spec.id,
+      questionId: null,
+      decision: input.decision,
+      rationale: input.rationale ?? "",
+      decidedBy: input.actor,
+      revision: input.revision ?? spec.revision,
+      acceptedComments: [],
+      status: "decided",
+    });
+    publishChanged(spec.id, "decision-recorded");
+    const rows = decisionsFor({ specId: spec.id, limit: 1 });
+    const first = rows[0];
+    if (first === undefined) throw new Error("Decision disappeared during create.");
+    return first;
+  }
+
+  // ---- research briefs -----------------------------------------------------
+
+  function researchFrom(row: ResearchRecord): Research {
+    return {
+      id: row.id,
+      specId: row.spec_id,
+      brief: row.brief,
+      threadId: row.thread_id,
+      status: row.status,
+      resultSpecId: row.result_spec_id,
+      error: row.error,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  function researchFor(specId: string): Research[] {
+    const rows = db
+      .prepare(
+        "SELECT * FROM research WHERE spec_id = ? ORDER BY created_at DESC LIMIT 10",
+      )
+      .all(specId) as ResearchRecord[];
+    return rows.map(researchFrom);
+  }
+
+  // ---- spec discussion (context, never a trigger) --------------------------
+
+  function specMessagesFor(specId: string, limit = 50): SpecMessage[] {
+    const rows = db
+      .prepare(
+        "SELECT * FROM spec_messages WHERE spec_id = ? ORDER BY created_at DESC LIMIT ?",
+      )
+      .all(specId, limit) as SpecMessageRecord[];
+    return rows.reverse().map((row) => ({
+      id: row.id,
+      specId: row.spec_id,
+      author: row.author,
+      body: row.body,
+      consumedAt: row.consumed_at,
+      createdAt: row.created_at,
+    }));
+  }
+
+  function postDiscussion(specId: string, author: string, body: string): SpecMessage {
+    const spec = findSpecById(specId);
+    if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
+    const id = `msg_${randomUUID().slice(0, 8)}`;
+    db.prepare(
+      "INSERT INTO spec_messages (id, spec_id, author, body, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(id, specId, author, body, nowIso());
+    publishChanged(specId, "discussion");
+    return {
+      id,
+      specId,
+      author,
+      body,
+      consumedAt: null,
+      createdAt: nowIso(),
+    };
+  }
+
+  function discussionContextFor(specId: string): string {
+    const messages = specMessagesFor(specId, 10).filter(
+      (message) => message.consumedAt === null && message.author !== "agent",
+    );
+    if (messages.length === 0) return "";
+    return [
+      "Recent discussion in the spec's chat (context, not requests):",
+      ...messages.map(
+        (message) => `- ${message.author}: ${truncate(message.body, 300)}`,
+      ),
+    ].join("\n");
+  }
+
+  function consumeDiscussion(specId: string): void {
+    db.prepare(
+      "UPDATE spec_messages SET consumed_at = ? WHERE spec_id = ? AND consumed_at IS NULL",
+    ).run(nowIso(), specId);
+  }
+
+  // ---- revision diffs ------------------------------------------------------
+
+  function revisionContent(specId: string, revision: number): string | null {
+    const row = db
+      .prepare(
+        "SELECT content FROM spec_revisions WHERE spec_id = ? AND revision = ?",
+      )
+      .get(specId, revision) as { content: string } | undefined;
+    return row?.content ?? null;
+  }
+
+  function diffTexts(
+    beforeText: string,
+    afterText: string,
+  ): { rows: Array<{ type: "same" | "add" | "del"; text: string }>; truncated: boolean } {
+    const before = beforeText.split("\n");
+    const after = afterText.split("\n");
+    const n = before.length;
+    const m = after.length;
+    if (n * m > 2_000_000) {
+      return {
+        truncated: true,
+        rows: [
+          { type: "del", text: `previous side: ${n} lines` },
+          { type: "add", text: `new side: ${m} lines` },
+          { type: "same", text: "Diff too large to inline — open the revision instead." },
+        ],
+      };
+    }
+    const width = m + 1;
+    const dp = new Uint32Array((n + 1) * width);
+    for (let i = n - 1; i >= 0; i -= 1) {
+      for (let j = m - 1; j >= 0; j -= 1) {
+        dp[i * width + j] =
+          before[i] === after[j]
+            ? dp[(i + 1) * width + j + 1] + 1
+            : Math.max(dp[(i + 1) * width + j], dp[i * width + j + 1]);
+      }
+    }
+    const rows: Array<{ type: "same" | "add" | "del"; text: string }> = [];
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+      if (before[i] === after[j]) {
+        rows.push({ type: "same", text: before[i] ?? "" });
+        i += 1;
+        j += 1;
+      } else if (dp[(i + 1) * width + j] >= dp[i * width + j + 1]) {
+        rows.push({ type: "del", text: before[i] ?? "" });
+        i += 1;
+      } else {
+        rows.push({ type: "add", text: after[j] ?? "" });
+        j += 1;
+      }
+    }
+    while (i < n) {
+      rows.push({ type: "del", text: before[i] ?? "" });
+      i += 1;
+    }
+    while (j < m) {
+      rows.push({ type: "add", text: after[j] ?? "" });
+      j += 1;
+    }
+    if (rows.length > 400) {
+      return {
+        truncated: true,
+        rows: [
+          ...rows.slice(0, 200),
+          { type: "same", text: `… ${rows.length - 400} unchanged lines …` },
+          ...rows.slice(rows.length - 200),
+        ],
+      };
+    }
+    return { truncated: false, rows };
+  }
+
+  function diffRevisions(
+    specId: string,
+    from: number,
+    to: number,
+  ): { rows: Array<{ type: "same" | "add" | "del"; text: string }>; truncated: boolean } {
+    return diffTexts(
+      revisionContent(specId, from) ?? "",
+      revisionContent(specId, to) ?? "",
+    );
+  }
+
+  // ---- agent conversation and research runs --------------------------------
+
+  async function askAgentInChat(
+    spec: SpecRecord,
+    text: string,
+    actor: string,
+  ): Promise<{ threadId: string }> {
+    const context = discussionContextFor(spec.id);
+    const message = [
+      `This thread is the discussion thread for spec "${spec.title}" (slug "${spec.slug}").`,
+      `Message from ${actor} in the spec chat:`,
+      text,
+      ...(context === "" ? [] : ["", context]),
+      "",
+      "Reply in this thread. If the message concerns an open question, also reply in that question's thread with specs_reply.",
+      "Only change the spec when the message asks for it, and prefer specs_propose when the change should be reviewed first.",
+    ].join("\n");
+    const chat = await ensureChatThread(spec, message);
+    if (!chat.created) {
+      await bb.sdk.threads.send({
+        threadId: chat.threadId,
+        mode: "auto",
+        input: [{ type: "text", text: message, mentions: [] }],
+      });
+    }
+    consumeDiscussion(spec.id);
+    return { threadId: chat.threadId };
+  }
+
+  function ackAgentChange(specId: string, revision: number): void {
+    const spec = findSpecById(specId);
+    if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
+    db.prepare("UPDATE specs SET acked_revision = ? WHERE id = ?").run(
+      revision,
+      specId,
+    );
+    publishChanged(specId, "agent-change-acked");
+  }
+
+  function revertToRevision(
+    specId: string,
+    toRevision: number,
+    actor: string,
+  ): { revision: number } {
+    const source = db
+      .prepare(
+        "SELECT title, summary, content FROM spec_revisions WHERE spec_id = ? AND revision = ?",
+      )
+      .get(specId, toRevision) as
+      | { title: string; summary: string; content: string }
+      | undefined;
+    if (source === undefined) {
+      throw new Error(`No revision v${toRevision} for this spec.`);
+    }
+    const updated = saveSpec({
+      id: specId,
+      content: source.content,
+      title: source.title,
+      summary: source.summary,
+      author: actor,
+    });
+    return { revision: updated.revision };
+  }
+
+  async function startResearch(
+    spec: SpecRecord,
+    brief: string,
+    actor: string,
+  ): Promise<ResearchRecord> {
+    const links = linksFor(spec.id);
+    const projectId = links[0]?.projectId ?? (await personalProjectId());
+    const environment =
+      links[0] === undefined
+        ? ({ type: "host", workspace: { type: "personal" } } as const)
+        : ({ type: "project-default" } as const);
+    const context = discussionContextFor(spec.id);
+    const prompt = [
+      `You are running a research brief for spec "${spec.title}" (slug "${spec.slug}").`,
+      "Investigate with read-only tools (web search and fetch, repository files, the spec store). Do not modify the spec, the repository, or any code.",
+      `Brief: ${brief}`,
+      ...(context === "" ? [] : ["", context]),
+      "",
+      "When done, reply with a single markdown report: a level-2 heading, under ~800 words, sources as links. End with a '## Open questions' list for anything the research could not settle.",
+    ].join("\n");
+    const thread = await bb.sdk.threads.spawn({
+      projectId,
+      environment,
+      prompt,
+      title: `Research: ${truncate(brief, 60)}`,
+      pluginMetadata: { specId: spec.id, researchBrief: brief },
+    });
+    db.prepare(
+      "INSERT OR REPLACE INTO thread_specs (thread_id, spec_id, mode, created_at) VALUES (?, ?, 'attached', ?)",
+    ).run(thread.id, spec.id, nowIso());
+    const timestamp = nowIso();
+    const record: ResearchRecord = {
+      id: `res_${randomUUID().slice(0, 8)}`,
+      spec_id: spec.id,
+      brief,
+      thread_id: thread.id,
+      status: "running",
+      result_spec_id: null,
+      error: "",
+      created_at: timestamp,
+      updated_at: timestamp,
+    };
+    db.prepare(
+      `INSERT INTO research (id, spec_id, brief, thread_id, status, result_spec_id, error, created_at, updated_at)
+       VALUES (?, ?, ?, ?, 'running', NULL, '', ?, ?)`,
+    ).run(record.id, spec.id, brief, thread.id, timestamp, timestamp);
+    consumeDiscussion(spec.id);
+    publishChanged(spec.id, "research-started");
+    return record;
+  }
+
+  async function finalizeResearch(
+    record: ResearchRecord,
+    status: "done" | "failed" | "cancelled",
+    output: string | null,
+    error: string,
+  ): Promise<void> {
+    let resultSpecId: string | null = null;
+    if (status === "done" && output !== null && output.trim() !== "") {
+      const parent = findSpecById(record.spec_id);
+      const result = createSpec({
+        title: truncate(record.brief, 80) || "Research",
+        summary:
+          parent === undefined ? "Research result" : `Research for ${parent.title}`,
+        content: output.trim(),
+        icon: "🔬",
+        projectIds: parent === undefined ? [] : projectIdsFor(parent.id),
+        ...(parent === undefined ? {} : { parentSpecId: parent.id }),
+        author: "agent",
+      });
+      resultSpecId = result.id;
+    }
+    db.prepare(
+      "UPDATE research SET status = ?, result_spec_id = ?, error = ?, updated_at = ? WHERE id = ?",
+    ).run(status, resultSpecId, error, nowIso(), record.id);
+    publishChanged(record.spec_id, `research-${status}`);
+  }
+
+  function runningResearchForThread(threadId: string): ResearchRecord | undefined {
+    return db
+      .prepare("SELECT * FROM research WHERE thread_id = ? AND status = 'running'")
+      .get(threadId) as ResearchRecord | undefined;
+  }
+
+  async function completeResearchFromThread(
+    threadId: string,
+    failure: string | null,
+  ): Promise<void> {
+    const record = runningResearchForThread(threadId);
+    if (record === undefined) return;
+    if (failure !== null) {
+      await finalizeResearch(record, "failed", null, failure);
+      return;
+    }
+    const output = await bb.sdk.threads.output({ threadId });
+    const text = output.output;
+    if (text === null || text.trim() === "") {
+      await finalizeResearch(record, "failed", null, "The run produced no output.");
+      return;
+    }
+    await finalizeResearch(record, "done", text, "");
+  }
+
+  async function reconcileResearch(specId: string): Promise<void> {
+    const running = db
+      .prepare("SELECT * FROM research WHERE spec_id = ? AND status = 'running'")
+      .all(specId) as ResearchRecord[];
+    for (const record of running) {
+      try {
+        const thread = await bb.sdk.threads.get({ threadId: record.thread_id });
+        const status = thread?.status;
+        if (status === "idle") {
+          await completeResearchFromThread(record.thread_id, null);
+        }
+      } catch (error) {
+        bb.log.warn(`research reconcile failed: ${String(error)}`);
+      }
+    }
   }
 
   // ---- context digest ------------------------------------------------------
@@ -1576,7 +2497,19 @@ export default async function plugin(bb: BbPluginApi) {
             `Open questions: ${countState("open")} open · ${countState("answered")} awaiting triage · ${countState("clarify")} in clarification${textQuestionCount === 0 ? "" : ` · ${textQuestionCount} in text`}.`,
             `List with specs_questions({ projectId }); promote text questions with specs_promote; close with specs_answer, specs_clarify, specs_resolve, or specs_dismiss.`,
           ].join(" ");
-    return `${[header, ...lines].join("\n")}\n${trailer}${questionLine === "" ? "" : `\n${questionLine}`}`;
+    const pendingProposals = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM proposals p
+         WHERE p.status = 'pending'
+           AND EXISTS (SELECT 1 FROM spec_projects sp WHERE sp.spec_id = p.spec_id AND sp.project_id = ?)`,
+      )
+      .get(projectId) as { n: number };
+    const proposalLine =
+      pendingProposals.n === 0
+        ? ""
+        : `${pendingProposals.n} spec proposal(s) await the user's review — the user applies them in the Specs page; do not resolve linked questions until applied.`;
+    const extra = [questionLine, proposalLine].filter((line) => line !== "").join("\n");
+    return `${[header, ...lines].join("\n")}\n${trailer}${extra === "" ? "" : `\n${extra}`}`;
   }
 
   function threadLinkMode(
@@ -1722,14 +2655,10 @@ export default async function plugin(bb: BbPluginApi) {
           annotation.state !== "resolved" &&
           annotation.state !== "dismissed",
       );
-      const decisions = annotations
-        .filter(
-          (annotation) =>
-            annotation.kind === "question" && annotation.decision !== "",
-        )
-        .sort((a, b) =>
-          (a.resolvedAt ?? a.updatedAt).localeCompare(b.resolvedAt ?? b.updatedAt),
-        );
+      const decisions = annotations.filter(
+        (annotation) =>
+          annotation.kind === "question" && annotation.decision !== "",
+      );
       if (notes.length > 0) {
         parts.push("", "## Open notes (review feedback)");
         for (const annotation of notes.slice(0, 20)) {
@@ -1764,10 +2693,32 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       if (decisions.length > 0) {
-        parts.push("", "## Decisions (audit)");
-        for (const decision of decisions.slice(0, 20)) {
+        parts.push("", "## Decision log (attributed, separate from the prose)");
+        for (const decision of decisionsFor({ specId: spec.id, limit: 20 })) {
           parts.push(
-            `- ${decision.id} "${truncate(decision.quote, 120)}" — ${truncate(decision.decision, 240)} (${decision.resolvedBy}, ${relativeTime(decision.resolvedAt ?? decision.updatedAt)}${decision.foldedRevision === null ? "" : `, folded into v${decision.foldedRevision}`})`,
+            `- ${decision.id} [${decision.status}] ${truncate(decision.decision, 240)} (${decision.decidedBy}${decision.revision === null ? "" : `, v${decision.revision}`})${decision.questionId === null ? "" : ` · from ${decision.questionId}`}${decision.rationale === "" ? "" : `\n    rationale: ${truncate(decision.rationale, 240)}`}`,
+          );
+        }
+      }
+      const pendingProposals = proposalsFor(spec.id).filter(
+        (proposal) => proposal.status === "pending",
+      );
+      if (pendingProposals.length > 0) {
+        parts.push("", "## Pending proposals (the user reviews and applies them)");
+        for (const proposal of pendingProposals.slice(0, 10)) {
+          parts.push(
+            `- ${proposal.id} against v${proposal.baseRevision}: ${proposal.note === "" ? "content change" : truncate(proposal.note, 200)}${proposal.questionId === null ? "" : ` · answers ${proposal.questionId}`}`,
+          );
+        }
+      }
+      const runs = researchFor(spec.id).filter(
+        (run) => run.status === "running" || run.resultSpecId !== null,
+      );
+      if (runs.length > 0) {
+        parts.push("", "## Research runs");
+        for (const run of runs.slice(0, 5)) {
+          parts.push(
+            `- ${run.id} [${run.status}] ${truncate(run.brief, 160)}${run.resultSpecId === null ? ` · thread ${run.threadId}` : ` · published as ${run.resultSpecId}`}`,
           );
         }
       }
@@ -1851,9 +2802,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "specs_write",
     description:
-      "Update a spec document's content, title, or summary. Pass expectedRevision (from the latest specs_read) so a concurrent edit is reported instead of overwritten. Returns the new revision.",
+      "Update a spec document's content, title, or summary. With the plugin's default agentWriteMode=propose this records a proposal the user reviews and applies; set agentWriteMode=direct to write immediately. Pass expectedRevision (from the latest specs_read) so a concurrent edit is reported instead of overwritten.",
     instructions:
-      "Apply agreed spec changes with specs_write and pass expectedRevision from the read; on conflict, re-read and merge instead of forcing.",
+      "Prefer proposals for changes the user has not explicitly asked for: create the proposal, then resolve the question with the decision and mention the proposal id. Use direct writes only when the user asked for the edit in this conversation.",
     presentation: {
       label: { pending: "Updating spec", completed: "Updated spec" },
       icon: { glyph: "EditFile" },
@@ -1865,8 +2816,12 @@ export default async function plugin(bb: BbPluginApi) {
       summary: z.string().max(500).optional(),
       icon: z.string().max(16).optional().describe("A single emoji shown next to the title."),
       expectedRevision: z.number().int().optional(),
+      questionId: z
+        .string()
+        .optional()
+        .describe("Question this change answers, so the applied revision links to its decision."),
     }),
-    execute: ({ idOrSlug, content, title, summary, icon, expectedRevision }, ctx) => {
+    execute: ({ idOrSlug, content, title, summary, icon, expectedRevision, questionId }, ctx) => {
       try {
         const spec = mustFindSpec(idOrSlug);
         if (
@@ -1876,6 +2831,20 @@ export default async function plugin(bb: BbPluginApi) {
           icon === undefined
         ) {
           return toolError("Provide at least one of content, title, summary, or icon.");
+        }
+        if (config.agentWriteMode === "propose" && content !== undefined) {
+          const proposal = createProposal({
+            specId: spec.id,
+            content,
+            ...(title === undefined ? {} : { title }),
+            ...(summary === undefined ? {} : { summary }),
+            note: "Agent-proposed change awaiting review",
+            author: "agent",
+            ...(questionId === undefined ? {} : { questionId }),
+          });
+          return toolText(
+            `Created proposal ${proposal.id} against v${proposal.base_revision}. The user reviews and applies it in the Specs page; record the decision with specs_resolve and mention the proposal, and the applied revision links back automatically.`,
+          );
         }
         const updated = saveSpec({
           id: spec.id,
@@ -1889,6 +2858,144 @@ export default async function plugin(bb: BbPluginApi) {
         recordRead(ctx.threadId, updated.id, updated.revision);
         return toolText(
           `Updated "${updated.title}" (${updated.slug}) to revision ${updated.revision}.`,
+        );
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_propose",
+    description:
+      "Propose a spec change for the user to review instead of writing it. The Specs page shows the proposal as a diff with Apply / Reject.",
+    instructions:
+      "Use specs_propose when a change should be owned by the user; link it to the question it answers with questionId.",
+    presentation: {
+      label: { pending: "Proposing change", completed: "Proposed change" },
+      icon: { glyph: "EditFile" },
+    },
+    parameters: z.object({
+      idOrSlug: z.string().min(1),
+      content: z.string().min(1).describe("Full replacement markdown content."),
+      title: z.string().min(1).max(200).optional(),
+      summary: z.string().max(500).optional(),
+      note: z.string().max(1000).optional().describe("One line on what changed and why."),
+      questionId: z.string().optional(),
+    }),
+    execute: ({ idOrSlug, content, title, summary, note, questionId }) => {
+      try {
+        const spec = mustFindSpec(idOrSlug);
+        const proposal = createProposal({
+          specId: spec.id,
+          content,
+          ...(title === undefined ? {} : { title }),
+          ...(summary === undefined ? {} : { summary }),
+          ...(note === undefined ? {} : { note }),
+          author: "agent",
+          ...(questionId === undefined ? {} : { questionId }),
+        });
+        return toolText(
+          `Created proposal ${proposal.id} against v${proposal.base_revision}. The user applies it in the Specs page.`,
+        );
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_decide",
+    description:
+      "Record a standalone decision for a spec (not tied to a question) in the decision log, so the record survives later prose rewrites.",
+    instructions:
+      "Record decisions the team makes outside the question loop with specs_decide.",
+    presentation: {
+      label: { pending: "Recording decision", completed: "Recorded decision" },
+      icon: { glyph: "CircleCheck" },
+    },
+    parameters: z.object({
+      idOrSlug: z.string().min(1),
+      decision: z.string().min(1).max(5000),
+      rationale: z.string().max(5000).optional(),
+      revision: z.number().int().optional(),
+    }),
+    execute: ({ idOrSlug, decision, rationale, revision }) => {
+      try {
+        const spec = mustFindSpec(idOrSlug);
+        const recorded = addStandaloneDecision({
+          specId: spec.id,
+          decision,
+          ...(rationale === undefined ? {} : { rationale }),
+          ...(revision === undefined ? {} : { revision }),
+          actor: "agent",
+        });
+        return toolText(`Recorded decision ${recorded.id} for "${spec.title}".`);
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_decisions",
+    description:
+      "List recorded decisions (attributed, revision-linked, with accepted comments) for a spec or project.",
+    instructions:
+      "Read specs_decisions before re-litigating a settled choice; the record is what the team agreed.",
+    presentation: {
+      label: { pending: "Reading decisions", completed: "Read decisions" },
+      icon: { glyph: "CircleCheck" },
+    },
+    parameters: z.object({
+      specIdOrSlug: z.string().optional(),
+      projectId: z.string().optional(),
+      limit: z.number().int().min(1).max(200).optional(),
+    }),
+    execute: ({ specIdOrSlug, projectId, limit }) => {
+      try {
+        const specId =
+          specIdOrSlug === undefined ? undefined : mustFindSpec(specIdOrSlug).id;
+        const rows = decisionsFor({
+          ...(specId === undefined ? {} : { specId }),
+          projectId: projectId ?? null,
+          ...(limit === undefined ? {} : { limit }),
+        });
+        if (rows.length === 0) return toolText("No decisions recorded.");
+        return toolText(
+          rows
+            .map(
+              (decision) =>
+                `${decision.id} [${decision.status}] ${decision.specId}${decision.questionId === null ? "" : ` · from ${decision.questionId}`}: ${truncate(decision.decision, 240)} (${decision.decidedBy}${decision.revision === null ? "" : `, v${decision.revision}`})${decision.rationale === "" ? "" : `\n    rationale: ${truncate(decision.rationale, 240)}`}`,
+            )
+            .join("\n"),
+        );
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "specs_research",
+    description:
+      "Start a research run for a spec. A background agent investigates the brief read-only and publishes the report as a child spec with its own questions and decisions.",
+    instructions:
+      "Start research when a question needs external evidence; the report lands as a child spec and the run is visible in the Specs page.",
+    presentation: {
+      label: { pending: "Starting research", completed: "Started research" },
+      icon: { glyph: "Search" },
+    },
+    parameters: z.object({
+      idOrSlug: z.string().min(1),
+      brief: z.string().min(1).max(2000),
+    }),
+    execute: async ({ idOrSlug, brief }) => {
+      try {
+        const spec = mustFindSpec(idOrSlug);
+        const record = await startResearch(spec, brief, "agent");
+        return toolText(
+          `Started research ${record.id} in thread ${record.thread_id}; the report publishes as a child spec when it finishes.`,
         );
       } catch (error) {
         return toolError(error instanceof Error ? error.message : String(error));
@@ -2273,6 +3380,10 @@ export default async function plugin(bb: BbPluginApi) {
     "specs_create",
     "specs_annotate",
     "specs_reply",
+    "specs_propose",
+    "specs_decide",
+    "specs_decisions",
+    "specs_research",
     "specs_questions",
     "specs_answer",
     "specs_clarify",
@@ -2283,6 +3394,22 @@ export default async function plugin(bb: BbPluginApi) {
     "specs_detach",
     "specs_delete",
   ];
+
+  // Research runs finish on their own thread's lifecycle; the plugin turns a
+  // completed run into a child spec. specs_get also reconciles stale rows.
+  bb.events.on("thread.idle", ({ thread }) => {
+    void completeResearchFromThread(thread.id, null).catch((error: unknown) => {
+      bb.log.warn(`research completion failed: ${String(error)}`);
+    });
+  });
+  bb.events.on("thread.failed", ({ thread, error }) => {
+    void completeResearchFromThread(
+      thread.id,
+      error === null || error === "" ? "The run failed." : error,
+    ).catch((failure: unknown) => {
+      bb.log.warn(`research failure handling failed: ${String(failure)}`);
+    });
+  });
 
   bb.agents.configure((context) => {
     try {
@@ -2357,6 +3484,23 @@ export default async function plugin(bb: BbPluginApi) {
         .get(spec.id) as { thread_id: string } | undefined;
       const projectId = links[0]?.projectId;
       const scan = scanSpecText(spec);
+      await reconcileResearch(spec.id);
+      const latest = db
+        .prepare(
+          "SELECT revision, author FROM spec_revisions WHERE spec_id = ? ORDER BY revision DESC LIMIT 1",
+        )
+        .get(spec.id) as { revision: number; author: string } | undefined;
+      const agentChange =
+        latest !== undefined && latest.author === "agent"
+          ? {
+              revision: latest.revision,
+              author: latest.author,
+              acked:
+                spec.acked_revision !== null &&
+                spec.acked_revision >= latest.revision,
+              previousRevision: latest.revision > 1 ? latest.revision - 1 : null,
+            }
+          : null;
       return {
         spec: {
           ...specSummary(spec),
@@ -2372,6 +3516,13 @@ export default async function plugin(bb: BbPluginApi) {
           source: question.source,
         })),
         textDecisions: scan.decisions,
+        proposals: proposalsFor(spec.id).filter(
+          (proposal) => proposal.status === "pending",
+        ),
+        decisions: decisionsFor({ specId: spec.id, limit: 100 }),
+        research: researchFor(spec.id),
+        discussion: specMessagesFor(spec.id, 50),
+        agentChange,
       };
     },
 
@@ -2507,6 +3658,67 @@ export default async function plugin(bb: BbPluginApi) {
         maybeDispatchQuestion(spec, created);
       }
       return result;
+    },
+
+    proposals_apply: ({ proposalId }) => {
+      return applyProposal(proposalId, "user");
+    },
+
+    proposals_reject: ({ proposalId, note }) => {
+      rejectProposal(proposalId, note ?? "", "user");
+      return { ok: true as const };
+    },
+
+    specs_diff: ({ id, from, to, content }) => {
+      const spec = findSpecById(id);
+      if (spec === undefined) throw new Error(`No spec with id ${id}.`);
+      const beforeText = revisionContent(spec.id, from) ?? "";
+      const afterText =
+        content !== undefined
+          ? content
+          : to === undefined
+            ? ""
+            : (revisionContent(spec.id, to) ?? "");
+      const result = diffTexts(beforeText, afterText);
+      return { from, to: to ?? null, ...result };
+    },
+
+    specs_ack_agent_change: ({ id, revision }) => {
+      ackAgentChange(id, revision);
+      return { ok: true as const };
+    },
+
+    specs_revert: ({ id, toRevision }) => {
+      return revertToRevision(id, toRevision, "user");
+    },
+
+    research_start: async ({ specId, brief }) => {
+      const spec = findSpecById(specId);
+      if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
+      const record = await startResearch(spec, brief, "user");
+      return { researchId: record.id, threadId: record.thread_id };
+    },
+
+    discussion_post: ({ specId, body }) => {
+      const message = postDiscussion(specId, "user", body);
+      return { id: message.id };
+    },
+
+    chat_ask: async ({ specId, text }) => {
+      const spec = findSpecById(specId);
+      if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
+      const result = await askAgentInChat(spec, text, "user");
+      return { ok: true as const, ...result };
+    },
+
+    decisions_list: ({ projectId, specId, limit }) => {
+      return {
+        decisions: decisionsFor({
+          ...(specId === undefined ? {} : { specId }),
+          projectId: projectId ?? null,
+          limit,
+        }),
+      };
     },
 
     annotations_comment: ({ annotationId, body }) => {
@@ -2702,6 +3914,18 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb specs clarify <annotation-id> <follow-up question> [--json]",
     "  bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]",
     "  bb specs dismiss <annotation-id> [--reason <text>] [--json]",
+    "  bb specs propose <id-or-slug> [--file <path>|--content <text>] [--note <text>] [--question <annotation-id>] [--json]",
+    "  bb specs proposals <id-or-slug> [--json]",
+    "  bb specs apply <proposal-id> [--json]",
+    "  bb specs reject <proposal-id> [--note <text>] [--json]",
+    "  bb specs decisions [<id-or-slug>] [--project <id>] [--json]",
+    "  bb specs decide <id-or-slug> --decision <text> [--rationale <text>] [--revision <n>] [--json]",
+    "  bb specs research <id-or-slug> <brief> [--json]",
+    "  bb specs diff <id-or-slug> --from <n> --to <n> [--json]",
+    "  bb specs revert <id-or-slug> --to <n> [--json]",
+    "  bb specs ack <id-or-slug> --revision <n> [--json]",
+    "  bb specs discuss <id-or-slug> <text> [--json]",
+    "  bb specs ask <id-or-slug> <text> [--json]",
     "  bb specs annotations <id-or-slug> [--all] [--json]",
     "  bb specs resolve <annotation-id> [--json]",
     "  bb specs history <id-or-slug> [--limit <n>] [--json]",
@@ -2735,6 +3959,18 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "clarify", summary: "Ask a follow-up question", usage: "bb specs clarify <annotation-id> <follow-up question> [--json]" },
       { name: "resolve-question", summary: "Close a question with a decision", usage: "bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]" },
       { name: "dismiss", summary: "Drop a question without deciding", usage: "bb specs dismiss <annotation-id> [--reason <text>] [--json]" },
+      { name: "propose", summary: "Propose a spec change for review", usage: "bb specs propose <id-or-slug> [--file <path>|--content <text>] [--note <text>] [--json]" },
+      { name: "proposals", summary: "List proposals for a spec", usage: "bb specs proposals <id-or-slug> [--json]" },
+      { name: "apply", summary: "Apply a pending proposal", usage: "bb specs apply <proposal-id> [--json]" },
+      { name: "reject", summary: "Reject a pending proposal", usage: "bb specs reject <proposal-id> [--note <text>] [--json]" },
+      { name: "decisions", summary: "List recorded decisions", usage: "bb specs decisions [<id-or-slug>] [--project <id>] [--json]" },
+      { name: "decide", summary: "Record a standalone decision", usage: "bb specs decide <id-or-slug> --decision <text> [--rationale <text>] [--json]" },
+      { name: "research", summary: "Start a research run for a spec", usage: "bb specs research <id-or-slug> <brief> [--json]" },
+      { name: "diff", summary: "Diff two revisions", usage: "bb specs diff <id-or-slug> --from <n> --to <n> [--json]" },
+      { name: "revert", summary: "Revert a spec to a revision's content", usage: "bb specs revert <id-or-slug> --to <n> [--json]" },
+      { name: "ack", summary: "Acknowledge an agent-made revision", usage: "bb specs ack <id-or-slug> --revision <n> [--json]" },
+      { name: "discuss", summary: "Post context to the spec discussion", usage: "bb specs discuss <id-or-slug> <text> [--json]" },
+      { name: "ask", summary: "Ask the spec agent in its chat thread", usage: "bb specs ask <id-or-slug> <text> [--json]" },
       { name: "annotations", summary: "List annotations", usage: "bb specs annotations <id-or-slug> [--all] [--json]" },
       { name: "resolve", summary: "Resolve an annotation", usage: "bb specs resolve <annotation-id> [--json]" },
       { name: "history", summary: "List spec revisions", usage: "bb specs history <id-or-slug> [--limit <n>] [--json]" },
@@ -2956,6 +4192,234 @@ export default async function plugin(bb: BbPluginApi) {
             return reply(
               { ok: true, id: comment.id },
               `Replied in ${annotationId} (${comment.id}).`,
+            );
+          }
+
+          case "propose": {
+            const idOrSlug = rest[0];
+            if (idOrSlug === undefined) return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const file = flagString("file");
+            const inline = flagString("content");
+            const content =
+              file !== undefined ? await readInvocationFile(ctx, file) : inline;
+            if (content === undefined) return fail("Provide --file or --content.");
+            const proposal = createProposal({
+              specId: spec.id,
+              content,
+              ...(flagString("title") === undefined
+                ? {}
+                : { title: flagString("title") }),
+              ...(flagString("summary") === undefined
+                ? {}
+                : { summary: flagString("summary") }),
+              ...(flagString("note") === undefined
+                ? {}
+                : { note: flagString("note") }),
+              ...(flagString("question") === undefined
+                ? {}
+                : { questionId: flagString("question") }),
+              author: ctx.threadId === undefined ? "cli" : "agent",
+            });
+            return reply(
+              { ok: true, id: proposal.id, baseRevision: proposal.base_revision },
+              `Proposed ${proposal.id} against v${proposal.base_revision}.`,
+            );
+          }
+
+          case "proposals": {
+            const idOrSlug = rest[0];
+            if (idOrSlug === undefined) return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const rows = db
+              .prepare(
+                "SELECT * FROM proposals WHERE spec_id = ? ORDER BY created_at DESC LIMIT 20",
+              )
+              .all(spec.id) as ProposalRecord[];
+            if (json) return reply(rows, "");
+            return reply(
+              rows,
+              rows.length === 0
+                ? "No proposals."
+                : rows
+                    .map(
+                      (row) =>
+                        `${row.id} [${row.status}] against v${row.base_revision}${row.question_id === null ? "" : ` · ${row.question_id}`} — ${row.note === "" ? "content change" : truncate(row.note, 120)}`,
+                    )
+                    .join("\n"),
+            );
+          }
+
+          case "apply": {
+            const proposalId = rest[0];
+            if (proposalId === undefined) return fail(usage);
+            const result = applyProposal(
+              proposalId,
+              ctx.threadId === undefined ? "cli" : "user",
+            );
+            return reply(
+              { ok: true, ...result },
+              `Applied ${proposalId} as v${result.revision}.`,
+            );
+          }
+
+          case "reject": {
+            const proposalId = rest[0];
+            if (proposalId === undefined) return fail(usage);
+            rejectProposal(
+              proposalId,
+              flagString("note") ?? rest.slice(1).join(" ").trim(),
+              ctx.threadId === undefined ? "cli" : "user",
+            );
+            return reply({ ok: true, proposalId }, `Rejected ${proposalId}.`);
+          }
+
+          case "decisions": {
+            const idOrSlug = rest[0];
+            const specId =
+              idOrSlug === undefined ? undefined : mustFindSpec(idOrSlug).id;
+            const rows = decisionsFor({
+              ...(specId === undefined ? {} : { specId }),
+              projectId: flagString("project") ?? null,
+            });
+            if (json) return reply(rows, "");
+            return reply(
+              rows,
+              rows.length === 0
+                ? "No decisions recorded."
+                : rows
+                    .map(
+                      (decision) =>
+                        `${decision.id} [${decision.status}] ${truncate(decision.decision, 160)} — ${decision.decidedBy}${decision.revision === null ? "" : `, v${decision.revision}`}${decision.questionId === null ? "" : ` · from ${decision.questionId}`}`,
+                    )
+                    .join("\n"),
+            );
+          }
+
+          case "decide": {
+            const idOrSlug = rest[0];
+            const decision =
+              flagString("decision") ?? rest.slice(1).join(" ").trim();
+            if (idOrSlug === undefined || decision === "") return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const revisionRaw = flagString("revision");
+            const revision =
+              revisionRaw === undefined ? undefined : Number.parseInt(revisionRaw, 10);
+            const recorded = addStandaloneDecision({
+              specId: spec.id,
+              decision,
+              ...(flagString("rationale") === undefined
+                ? {}
+                : { rationale: flagString("rationale") }),
+              ...(revision === undefined || Number.isNaN(revision)
+                ? {}
+                : { revision }),
+              actor: ctx.threadId === undefined ? "cli" : "agent",
+            });
+            return reply(
+              { ok: true, id: recorded.id },
+              `Recorded decision ${recorded.id}.`,
+            );
+          }
+
+          case "research": {
+            const idOrSlug = rest[0];
+            const brief = rest.slice(1).join(" ").trim();
+            if (idOrSlug === undefined || brief === "") return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const record = await startResearch(
+              spec,
+              brief,
+              ctx.threadId === undefined ? "cli" : "agent",
+            );
+            return reply(
+              { ok: true, researchId: record.id, threadId: record.thread_id },
+              `Started research ${record.id} in thread ${record.thread_id}.`,
+            );
+          }
+
+          case "diff": {
+            const idOrSlug = rest[0];
+            const fromRaw = flagString("from");
+            const toRaw = flagString("to");
+            if (idOrSlug === undefined || fromRaw === undefined || toRaw === undefined) {
+              return fail(usage);
+            }
+            const spec = mustFindSpec(idOrSlug);
+            const from = Number.parseInt(fromRaw, 10);
+            const to = Number.parseInt(toRaw, 10);
+            if (Number.isNaN(from) || Number.isNaN(to)) return fail(usage);
+            const result = diffRevisions(spec.id, from, to);
+            if (json) return reply({ from, to, ...result }, "");
+            return reply(
+              { from, to, ...result },
+              result.rows
+                .map(
+                  (row) =>
+                    `${row.type === "add" ? "+" : row.type === "del" ? "-" : " "} ${row.text}`,
+                )
+                .join("\n"),
+            );
+          }
+
+          case "revert": {
+            const idOrSlug = rest[0];
+            const toRaw = flagString("to");
+            if (idOrSlug === undefined || toRaw === undefined) return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const toRevision = Number.parseInt(toRaw, 10);
+            if (Number.isNaN(toRevision)) return fail(usage);
+            const result = revertToRevision(
+              spec.id,
+              toRevision,
+              ctx.threadId === undefined ? "cli" : "user",
+            );
+            return reply(
+              { ok: true, ...result },
+              `Reverted ${spec.slug} to the content of v${toRevision} (new revision ${result.revision}).`,
+            );
+          }
+
+          case "ack": {
+            const idOrSlug = rest[0];
+            const revisionRaw = flagString("revision");
+            if (idOrSlug === undefined || revisionRaw === undefined) return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const revision = Number.parseInt(revisionRaw, 10);
+            if (Number.isNaN(revision)) return fail(usage);
+            ackAgentChange(spec.id, revision);
+            return reply({ ok: true }, `Acknowledged v${revision}.`);
+          }
+
+          case "discuss": {
+            const idOrSlug = rest[0];
+            const body = rest.slice(1).join(" ").trim();
+            if (idOrSlug === undefined || body === "") return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const message = postDiscussion(
+              spec.id,
+              ctx.threadId === undefined ? "user" : "agent",
+              body,
+            );
+            return reply(
+              { ok: true, id: message.id },
+              `Posted to the spec discussion (${message.id}). It is context for the next agent turn; it does not start one.`,
+            );
+          }
+
+          case "ask": {
+            const idOrSlug = rest[0];
+            const text = rest.slice(1).join(" ").trim();
+            if (idOrSlug === undefined || text === "") return fail(usage);
+            const spec = mustFindSpec(idOrSlug);
+            const result = await askAgentInChat(
+              spec,
+              text,
+              ctx.threadId === undefined ? "user" : "agent",
+            );
+            return reply(
+              { ok: true, ...result },
+              `Asked in thread ${result.threadId}.`,
             );
           }
 
