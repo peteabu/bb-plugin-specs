@@ -9,6 +9,11 @@ backed by the same store:
 - **Specs page** (left sidebar, `app.slots.navPanel`) — browse, read, edit,
   annotate selected text, reply to annotations, and chat in the spec's own
   agent thread.
+- **Specs panel tab** (`threadPanelAction` "Specs") — the same workspace as a
+  flush tab in a thread's right panel, so a spec sits beside the conversation.
+- **Full-screen overlay** (`experimental_appOverlay`) — a chrome-less Specs
+  surface over the whole app, opened from the command palette
+  ("Specs: open the workspace") or the composer's `+` menu; Esc returns.
 - **Thread action "Spec context"** (`app.slots.threadPanelAction`) — see and
   edit exactly which specs the current thread receives, with a preview of the
   injected context block.

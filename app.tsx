@@ -1679,7 +1679,21 @@ function CommentsRail({
 // Specs page
 // ---------------------------------------------------------------------------
 
-function SpecsPage({ subPath }: { subPath: string }) {
+function SpecsWorkspace({
+  selectedSlug,
+  tabPart,
+  showSidebar,
+  chrome,
+  onSelectSpec,
+  onSelectTab,
+}: {
+  selectedSlug: string;
+  tabPart: string;
+  showSidebar: boolean;
+  chrome: "route" | "panel" | "overlay";
+  onSelectSpec: (slug: string) => void;
+  onSelectTab: (tab: "document" | "annotations" | "chat") => void;
+}) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
   const bbContext = useBbContext();
@@ -1723,9 +1737,6 @@ function SpecsPage({ subPath }: { subPath: string }) {
   const focusTitleRef = useRef(false);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
   const contentInputRef = useRef<HTMLTextAreaElement | null>(null);
-
-  const [slugPart = "", tabPart = ""] = subPath.split("/");
-  const selectedSlug = slugPart;
 
   const refetchList = useCallback(() => {
     rpc.call("specs_list", {}).then(
@@ -1937,9 +1948,10 @@ function SpecsPage({ subPath }: { subPath: string }) {
   };
 
   const selectSpec = (slug: string) => {
+    if (slug === selectedSlug) return;
     setEditing(false);
     editingSpecRef.current = null;
-    navigate.toPluginPanel("specs", { subPath: slug });
+    onSelectSpec(slug);
   };
 
   const defaultProjectId =
@@ -1967,9 +1979,9 @@ function SpecsPage({ subPath }: { subPath: string }) {
 
   const setRailAndNavigate = (next: "none" | "comments" | "chat") => {
     setRail(next);
-    navigate.toPluginPanel("specs", {
-      subPath: next === "none" ? selectedSlug : `${selectedSlug}/${next}`,
-    });
+    onSelectTab(
+      next === "none" ? "document" : next === "comments" ? "annotations" : "chat",
+    );
   };
 
   const openEmoji = async (emoji: string) => {
@@ -2273,19 +2285,22 @@ function SpecsPage({ subPath }: { subPath: string }) {
 
   return (
     <div className="specs-root relative flex h-full min-h-0 w-full bg-background text-foreground">
-      <SpecsSidebar
-        specs={specs}
-        projects={projects}
-        selectedSlug={selectedSlug}
-        query={query}
-        onQuery={setQuery}
-        onSelect={selectSpec}
-        onNewDefault={() => void createSpec(defaultProjectId)}
-        onNewInGroup={(projectId) => void createSpec(projectId)}
-      />
+      {showSidebar ? (
+        <SpecsSidebar
+          specs={specs}
+          projects={projects}
+          selectedSlug={selectedSlug}
+          query={query}
+          onQuery={setQuery}
+          onSelect={selectSpec}
+          onNewDefault={() => void createSpec(defaultProjectId)}
+          onNewInGroup={(projectId) => void createSpec(projectId)}
+        />
+      ) : null}
 
       <main className="flex min-w-0 flex-1 flex-col">
         {detail === null ? (
+          chrome === "route" ? (
           <div className="flex min-h-0 flex-1 items-center justify-center p-8">
             <div className="w-full max-w-sm space-y-3">
               {detailError === null ? (
@@ -2329,9 +2344,30 @@ function SpecsPage({ subPath }: { subPath: string }) {
               </div>
             </div>
           </div>
+          ) : (
+            <div className="flex min-h-0 flex-1 flex-col">
+              {detailError === null ? null : (
+                <p className="border-b border-border px-4 py-2 text-sm text-destructive">
+                  {detailError}
+                </p>
+              )}
+              <SpecPicker
+                specs={specs}
+                projects={projects}
+                selectedSlug={selectedSlug}
+                onSelect={selectSpec}
+                onNew={() => void createSpec(defaultProjectId)}
+              />
+            </div>
+          )
         ) : (
           <>
             <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
+              {chrome === "route" || selectedSlug === "" ? null : (
+                <IconButton label="All specs" onClick={() => onSelectSpec("")}>
+                  <Icon name="ChevronLeft" className="size-4" />
+                </IconButton>
+              )}
               <div className="min-w-0 flex-1 md:hidden">
                 <select
                   aria-label="Select spec"
@@ -3041,6 +3077,216 @@ function SpecsPage({ subPath }: { subPath: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// Spec pickers and shells (route page, thread panel tab, app overlay)
+// ---------------------------------------------------------------------------
+
+function SpecPicker({
+  specs,
+  projects,
+  selectedSlug,
+  onSelect,
+  onNew,
+}: {
+  specs: SpecSummary[] | null;
+  projects: ProjectSummary[];
+  selectedSlug: string;
+  onSelect: (slug: string) => void;
+  onNew: () => void;
+}) {
+  const projectNames = useMemo(
+    () => new Map(projects.map((project) => [project.id, project.name])),
+    [projects],
+  );
+  const [query, setQuery] = useState("");
+  const visible = (specs ?? []).filter((spec) => {
+    const needle = query.trim().toLowerCase();
+    if (needle === "") return true;
+    return `${spec.title} ${spec.slug} ${spec.summary}`
+      .toLowerCase()
+      .includes(needle);
+  });
+  return (
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="border-b border-border p-3">
+        <div className="flex items-center gap-2">
+          <div className="relative min-w-0 flex-1">
+            <Icon
+              name="Search"
+              className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+            />
+            <Input
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder="Search specs"
+              className="h-8 bg-secondary/50 pl-8 text-xs"
+              autoFocus
+            />
+          </div>
+          <Button size="sm" className="h-8 shrink-0 px-2.5" onClick={onNew}>
+            <Icon name="Plus" className="size-3.5" />
+            New
+          </Button>
+        </div>
+      </div>
+      <div className="specs-scroll min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
+        {specs === null ? (
+          <p className="p-2 text-sm text-muted-foreground">Loading…</p>
+        ) : visible.length === 0 ? (
+          <div className="p-1">
+            <EmptyState>
+              {specs.length === 0
+                ? "No specs yet. Create one, or let an agent call specs_create."
+                : "Nothing matches."}
+            </EmptyState>
+          </div>
+        ) : (
+          visible.map((spec) => {
+            const selected = spec.slug === selectedSlug;
+            const projectLabel = spec.projectIds
+              .map((id) => projectNames.get(id) ?? id)
+              .join(", ");
+            return (
+              <button
+                key={spec.id}
+                type="button"
+                onClick={() => onSelect(spec.slug)}
+                className={cn(
+                  "specs-row flex w-full items-center gap-2 rounded-md px-2 py-2 text-left",
+                  selected
+                    ? "bg-state-active text-foreground"
+                    : "text-foreground/90 hover:bg-state-hover",
+                )}
+              >
+                <span className="w-5 shrink-0 text-center text-sm leading-none">
+                  {spec.icon}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-[13px]">{spec.title}</span>
+                  <span className="block truncate text-[11px] text-muted-foreground tabular-nums">
+                    {projectLabel === "" ? "unlinked" : projectLabel} · v
+                    {spec.revision} · {relativeTime(spec.updatedAt)}
+                  </span>
+                </span>
+                {spec.openAnnotations > 0 ? (
+                  <span className="shrink-0 rounded-full bg-primary/15 px-1.5 text-[10px] text-primary tabular-nums">
+                    {spec.openAnnotations}
+                  </span>
+                ) : null}
+              </button>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** The classic sidebar page: full spec list plus the workspace. */
+function SpecsPage({ subPath }: { subPath: string }) {
+  const navigate = useBbNavigate();
+  const [slugPart = "", tabPart = ""] = subPath.split("/");
+  return (
+    <SpecsWorkspace
+      selectedSlug={slugPart}
+      tabPart={tabPart}
+      showSidebar
+      chrome="route"
+      onSelectSpec={(slug) => navigate.toPluginPanel("specs", { subPath: slug })}
+      onSelectTab={(tab) => {
+        navigate.toPluginPanel("specs", {
+          subPath: tab === "document" ? slugPart : `${slugPart}/${tab}`,
+        });
+      }}
+    />
+  );
+}
+
+/** Specs rendered as a closable tab in a thread's right panel. */
+function SpecsPanelTab({ params }: { params: unknown }) {
+  const initial =
+    typeof params === "object" &&
+    params !== null &&
+    typeof (params as { specId?: unknown }).specId === "string"
+      ? (params as { specId: string }).specId
+      : "";
+  const [slug, setSlug] = useState(initial);
+  const [tab, setTab] = useState<"document" | "annotations" | "chat">("document");
+  return (
+    <SpecsWorkspace
+      selectedSlug={slug}
+      tabPart={tab}
+      showSidebar={false}
+      chrome="panel"
+      onSelectSpec={(next) => {
+        setSlug(next);
+        setTab("document");
+      }}
+      onSelectTab={setTab}
+    />
+  );
+}
+
+/** Full-screen, chrome-less Specs surface toggled from the palette or footer. */
+function SpecsOverlay() {
+  const [open, setOpen] = useState(false);
+  const [slug, setSlug] = useState(
+    () => window.localStorage.getItem("specs:lastSlug") ?? "",
+  );
+  const [tab, setTab] = useState<"document" | "annotations" | "chat">("document");
+
+  useEffect(() => {
+    const onOpen = () => setOpen(true);
+    window.addEventListener("specs:open", onOpen);
+    return () => window.removeEventListener("specs:open", onOpen);
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  useEffect(() => {
+    if (slug !== "") window.localStorage.setItem("specs:lastSlug", slug);
+  }, [slug]);
+
+  if (!open) return null;
+  return (
+    <div className="specs-root fixed inset-0 z-[120] flex flex-col bg-background text-foreground">
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
+        <Icon name="FileText" className="size-4 text-muted-foreground" />
+        <span className="text-sm font-semibold tracking-tight">Specs</span>
+        <span className="min-w-0 flex-1" />
+        <Button
+          size="sm"
+          variant="ghost"
+          className="h-7 px-2.5"
+          onClick={() => setOpen(false)}
+        >
+          Close ⎋
+        </Button>
+      </div>
+      <div className="flex min-h-0 flex-1">
+        <SpecsWorkspace
+          selectedSlug={slug}
+          tabPart={tab}
+          showSidebar={false}
+          chrome="overlay"
+          onSelectSpec={(next) => {
+            setSlug(next);
+            setTab("document");
+          }}
+          onSelectTab={setTab}
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Thread right-panel action: this thread's spec context
 // ---------------------------------------------------------------------------
 
@@ -3185,9 +3431,41 @@ export default definePluginApp((app) => {
     component: SpecsPage,
   });
   app.slots.threadPanelAction({
+    id: "specs-workspace",
+    title: "Specs",
+    icon: "FileText",
+    component: SpecsPanelTab,
+    layout: "flush",
+  });
+  app.slots.threadPanelAction({
     id: "specs-context",
     title: "Spec context",
     icon: "FileText",
     component: ThreadSpecsPanel,
+  });
+  app.slots.experimental_appOverlay({
+    id: "specs-overlay",
+    component: SpecsOverlay,
+  });
+  app.slots.commandPaletteAction({
+    id: "open-specs",
+    title: "Specs: open the workspace",
+    run: () => {
+      window.dispatchEvent(new CustomEvent("specs:open"));
+    },
+  });
+  app.composer.customize({
+    id: "specs-open",
+    plusMenu: [
+      {
+        id: "open-specs",
+        label: "Open Specs",
+        icon: "FileText",
+        description: "Open the Specs workspace without leaving this thread",
+        run: () => {
+          window.dispatchEvent(new CustomEvent("specs:open"));
+        },
+      },
+    ],
   });
 });

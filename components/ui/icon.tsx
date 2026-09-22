@@ -36,6 +36,7 @@ const ICONS: Record<string, ReactNode> = {
   ),
   Check: <path d="M4.5 12.5 9.5 17.5 19.5 7" />,
   ChevronDown: <path d="m6 9.5 6 6 6-6" />,
+  ChevronLeft: <path d="m15 6-6 6 6 6" />,
   ChevronRight: <path d="m9.5 6 6 6-6 6" />,
   CircleCheck: (
     <>
