@@ -1697,6 +1697,7 @@ function SpecsWorkspace({
   chrome,
   onSelectSpec,
   onSelectTab,
+  onOpenThread,
 }: {
   selectedSlug: string;
   tabPart: string;
@@ -1704,6 +1705,7 @@ function SpecsWorkspace({
   chrome: "route" | "panel" | "overlay";
   onSelectSpec: (slug: string) => void;
   onSelectTab: (tab: "document" | "annotations" | "chat") => void;
+  onOpenThread: (threadId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
   const navigate = useBbNavigate();
@@ -1787,6 +1789,30 @@ function SpecsWorkspace({
     }
     refetchDetail(selectedSlug);
   }, [selectedSlug, refetchDetail]);
+
+  // Shells without a visible list (or before the user picks) open the most
+  // recent spec for the current project, falling back to the most recent
+  // overall. Runs once per mount so "back to all specs" stays put.
+  const autoSelectedRef = useRef(false);
+  useEffect(() => {
+    if (
+      autoSelectedRef.current ||
+      chrome === "route" ||
+      selectedSlug !== "" ||
+      specs === null ||
+      specs.length === 0
+    ) {
+      return;
+    }
+    autoSelectedRef.current = true;
+    const projectId = bbContext.projectId;
+    const candidate =
+      (projectId === null || projectId === undefined
+        ? undefined
+        : specs.find((spec) => spec.projectIds.includes(projectId))) ??
+      specs[0];
+    if (candidate !== undefined) onSelectSpec(candidate.slug);
+  }, [chrome, selectedSlug, specs, onSelectSpec, bbContext.projectId]);
 
   useEffect(() => {
     if (tabPart === "annotations") setRail("comments");
@@ -2053,7 +2079,7 @@ function SpecsWorkspace({
       );
       setDetail(null);
       refetchList();
-      navigate.toPluginPanel("specs");
+      onSelectSpec("");
     } catch (cause) {
       toast.error(messageOf(cause));
     } finally {
@@ -2355,6 +2381,41 @@ function SpecsWorkspace({
               </div>
             </div>
           </div>
+          ) : showSidebar ? (
+            <>
+              <div className="hidden min-h-0 flex-1 items-center justify-center p-8 md:flex">
+                <div className="w-full max-w-sm space-y-3 text-center">
+                  <div className="text-4xl">📄</div>
+                  <p className="text-sm text-muted-foreground">
+                    Pick a spec on the left, or create one.
+                  </p>
+                  <div className="flex justify-center">
+                    <Button
+                      variant="outline"
+                      disabled={creating}
+                      onClick={() => void createSpec(defaultProjectId)}
+                    >
+                      <Icon name="Plus" className="size-4" />
+                      New spec
+                    </Button>
+                  </div>
+                </div>
+              </div>
+              <div className="flex min-h-0 flex-1 flex-col md:hidden">
+                {detailError === null ? null : (
+                  <p className="border-b border-border px-4 py-2 text-sm text-destructive">
+                    {detailError}
+                  </p>
+                )}
+                <SpecPicker
+                  specs={specs}
+                  projects={projects}
+                  selectedSlug={selectedSlug}
+                  onSelect={selectSpec}
+                  onNew={() => void createSpec(defaultProjectId)}
+                />
+              </div>
+            </>
           ) : (
             <div className="flex min-h-0 flex-1 flex-col">
               {detailError === null ? null : (
@@ -2614,7 +2675,7 @@ function SpecsWorkspace({
                       <ResearchCard
                         key={run.id}
                         run={run}
-                        onOpenRun={() => navigate.toThread(run.threadId)}
+                        onOpenRun={() => onOpenThread(run.threadId)}
                         onOpenResult={() => {
                           if (run.resultSpecId !== null) {
                             selectSpec(run.resultSpecId);
@@ -2787,14 +2848,14 @@ function SpecsWorkspace({
               <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
                 <button
                   type="button"
-                  onClick={() => navigate.toThread(detail.chatThreadId!)}
+                  onClick={() => onOpenThread(detail.chatThreadId!)}
                   className="min-w-0 flex-1 cursor-pointer truncate text-left text-xs font-medium hover:underline"
                 >
                   Chat
                 </button>
                 <IconButton
                   label="Open thread in sidebar"
-                  onClick={() => navigate.toThread(detail.chatThreadId!)}
+                  onClick={() => onOpenThread(detail.chatThreadId!)}
                 >
                   <Icon name="NewTab" className="size-3.5" />
                 </IconButton>
@@ -3225,12 +3286,14 @@ function SpecsPage({ subPath }: { subPath: string }) {
           subPath: tab === "document" ? slugPart : `${slugPart}/${tab}`,
         });
       }}
+      onOpenThread={(threadId) => navigate.toThread(threadId)}
     />
   );
 }
 
 /** Specs rendered as a closable tab in a thread's right panel. */
 function SpecsPanelTab({ params }: { params: unknown }) {
+  const navigate = useBbNavigate();
   const initial =
     typeof params === "object" &&
     params !== null &&
@@ -3250,16 +3313,16 @@ function SpecsPanelTab({ params }: { params: unknown }) {
         setTab("document");
       }}
       onSelectTab={setTab}
+      onOpenThread={(threadId) => navigate.toThread(threadId)}
     />
   );
 }
 
 /** Full-screen, chrome-less Specs surface toggled from the palette or footer. */
 function SpecsOverlay() {
+  const navigate = useBbNavigate();
   const [open, setOpen] = useState(false);
-  const [slug, setSlug] = useState(
-    () => window.localStorage.getItem("specs:lastSlug") ?? "",
-  );
+  const [slug, setSlug] = useState("");
   const [tab, setTab] = useState<"document" | "annotations" | "chat">("document");
 
   useEffect(() => {
@@ -3276,10 +3339,6 @@ function SpecsOverlay() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
-
-  useEffect(() => {
-    if (slug !== "") window.localStorage.setItem("specs:lastSlug", slug);
-  }, [slug]);
 
   if (!open) return null;
   return (
@@ -3301,13 +3360,17 @@ function SpecsOverlay() {
         <SpecsWorkspace
           selectedSlug={slug}
           tabPart={tab}
-          showSidebar={false}
+          showSidebar
           chrome="overlay"
           onSelectSpec={(next) => {
             setSlug(next);
             setTab("document");
           }}
           onSelectTab={setTab}
+          onOpenThread={(threadId) => {
+            setOpen(false);
+            navigate.toThread(threadId);
+          }}
         />
       </div>
     </div>
@@ -3338,7 +3401,6 @@ function linkAction(
 
 function ThreadSpecsPanel({ threadId }: { threadId: string }) {
   const rpc = useRpc<typeof rpcContract>();
-  const navigate = useBbNavigate();
   const [data, setData] = useState<ThreadSpecsResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
@@ -3387,7 +3449,9 @@ function ThreadSpecsPanel({ threadId }: { threadId: string }) {
           size="sm"
           variant="outline"
           className="shrink-0"
-          onClick={() => navigate.toPluginPanel("specs")}
+          onClick={() => {
+            window.dispatchEvent(new CustomEvent("specs:open"));
+          }}
         >
           <Icon name="FileText" className="size-3.5" />
           Open Specs
