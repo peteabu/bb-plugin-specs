@@ -100,11 +100,16 @@ are labelled "not audited".
 ## Proposals, decisions, and research
 
 - **People own the document.** With the default `agentWriteMode=propose`,
-  `specs_write` records a proposal the user reviews and applies (the UI shows a
+  `specs_write` and agent-thread `bb specs write` calls record a proposal the user reviews and applies, including title, summary, and icon edits (the UI shows a
   diff with Apply / Reject). Link a proposal to the question it answers with
   `questionId`; applying it then links the new revision to that decision and
   records an `applied` event. Use `specs_propose` for edits you initiate and
   `specs_write` when the user explicitly asked for the edit.
+  Pass the revision you read as `expectedRevision` (CLI: `--expected-revision`)
+  on writes and proposals; stale submissions are rejected. A linked question
+  must belong to the same spec. In proposal mode, agents cannot use the CLI to
+  apply, reject, acknowledge, or revert changes; those are user review actions.
+  With `agentWriteMode=direct`, agent CLI mutations retain agent attribution.
 - **Decisions are the record.** `specs_resolve`/`specs_dismiss` write an
   attributed decision (decider, revision, rationale, accepted comments) that
   survives later rewrites; `specs_decide` records one without a question and
@@ -122,7 +127,7 @@ are labelled "not audited".
 ## Conventions
 
 - **Read before writing.** `specs_read` returns the current revision; use it as
-  `expectedRevision` on `specs_write`. Never force-overwrite on conflict.
+  `expectedRevision` on `specs_write` or `specs_propose`. Never force-overwrite on conflict.
 - **Every content change bumps the revision.** Downstream threads see the bump
   in their context and re-read.
 - **Annotate, don't silently rewrite.** If feedback is a question or a concern,

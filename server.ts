@@ -92,6 +92,7 @@ const proposalSchema = z.object({
   title: z.string(),
   summary: z.string(),
   content: z.string(),
+  icon: z.string().nullable(),
   note: z.string(),
   author: z.string(),
   questionId: z.string().nullable(),
@@ -459,6 +460,7 @@ interface ProposalRecord {
   title: string;
   summary: string;
   content: string;
+  icon: string | null;
   note: string;
   author: string;
   question_id: string | null;
@@ -877,6 +879,7 @@ export default async function plugin(bb: BbPluginApi) {
     `CREATE INDEX IF NOT EXISTS spec_messages_spec_idx ON spec_messages(spec_id)`,
     `ALTER TABLE specs ADD COLUMN acked_revision INTEGER`,
     `ALTER TABLE specs ADD COLUMN parent_spec_id TEXT`,
+    `ALTER TABLE proposals ADD COLUMN icon TEXT`,
   ]);
 
   // ---- project name cache (sync digest needs names without async sdk calls) --
@@ -1421,6 +1424,40 @@ export default async function plugin(bb: BbPluginApi) {
     return updated;
   }
 
+  // Native tools and thread-scoped CLI calls share the same write policy.
+  function writeSpec(
+    input: Parameters<typeof saveSpec>[0] & { questionId?: string },
+  ): { proposal: ProposalRecord } | { spec: SpecRecord } {
+    if (
+      input.content === undefined && input.title === undefined &&
+      input.summary === undefined && input.icon === undefined
+    ) {
+      throw new Error("Provide at least one of content, title, summary, or icon.");
+    }
+    if (input.author === "agent" && config.agentWriteMode === "propose") {
+      return {
+        proposal: createProposal({
+          specId: input.id,
+          content: input.content,
+          title: input.title,
+          summary: input.summary,
+          icon: input.icon,
+          expectedRevision: input.expectedRevision,
+          questionId: input.questionId,
+          note: "Agent-proposed change awaiting review",
+          author: input.author,
+        }),
+      };
+    }
+    return { spec: saveSpec(input) };
+  }
+
+  function assertReviewAuthority(actor: string): void {
+    if (actor === "agent" && config.agentWriteMode === "propose") {
+      throw new Error("This action requires user review while agentWriteMode is propose. Ask the user to review it in the Specs page.");
+    }
+  }
+
   class RevisionConflictError extends Error {
     readonly currentRevision: number;
     readonly updatedAt: string;
@@ -1434,10 +1471,50 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  const chatCreations = new Map<
+    string,
+    Promise<{ threadId: string; created: boolean }>
+  >();
+
   async function ensureChatThread(
     spec: SpecRecord,
     firstPrompt?: string,
   ): Promise<{ threadId: string; created: boolean }> {
+    const pending = chatCreations.get(spec.id);
+    if (pending !== undefined) {
+      const chat = await pending;
+      // Only the creator's prompt was sent with spawn. Other callers must send
+      // their own messages to the shared thread.
+      return { threadId: chat.threadId, created: false };
+    }
+    const creation = createChatThread(spec, firstPrompt);
+    chatCreations.set(spec.id, creation);
+    try {
+      return await creation;
+    } finally {
+      chatCreations.delete(spec.id);
+    }
+  }
+
+  async function discardThreadForDeletedSpec(
+    specId: string,
+    threadId: string,
+  ): Promise<void> {
+    for (const action of ["stop", "archive"] as const) {
+      try {
+        await bb.sdk.threads[action]({ threadId });
+      } catch (error) {
+        bb.log.warn(`deleted spec thread ${action} failed: ${String(error)}`);
+      }
+    }
+    throw new Error(`No spec with id ${specId}.`);
+  }
+
+  async function createChatThread(
+    spec: SpecRecord,
+    firstPrompt?: string,
+  ): Promise<{ threadId: string; created: boolean }> {
+    mustFindSpec(spec.id);
     const existing = db
       .prepare("SELECT thread_id FROM chat_threads WHERE spec_id = ?")
       .get(spec.id) as { thread_id: string } | undefined;
@@ -1445,6 +1522,7 @@ export default async function plugin(bb: BbPluginApi) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: existing.thread_id });
         if (thread !== null && thread !== undefined) {
+          mustFindSpec(spec.id);
           return { threadId: existing.thread_id, created: false };
         }
       } catch {
@@ -1454,6 +1532,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const links = linksFor(spec.id);
     const projectId = links[0]?.projectId ?? (await personalProjectId());
+    mustFindSpec(spec.id);
     const environment =
       links[0] === undefined
         ? ({ type: "host", workspace: { type: "personal" } } as const)
@@ -1471,6 +1550,9 @@ export default async function plugin(bb: BbPluginApi) {
       title: `Spec: ${truncate(spec.title, 80)}`,
       pluginMetadata: { specId: spec.id },
     });
+    if (findSpecById(spec.id) === undefined) {
+      await discardThreadForDeletedSpec(spec.id, thread.id);
+    }
     const timestamp = nowIso();
     db.prepare(
       "INSERT OR REPLACE INTO chat_threads (spec_id, thread_id, created_at) VALUES (?, ?, ?)",
@@ -1493,12 +1575,27 @@ export default async function plugin(bb: BbPluginApi) {
     const annotationIds = db
       .prepare("SELECT id FROM annotations WHERE spec_id = ?")
       .all(spec.id) as Array<{ id: string }>;
+    const runningResearch = db
+      .prepare("SELECT thread_id FROM research WHERE spec_id = ? AND status = 'running'")
+      .all(spec.id) as Array<{ thread_id: string }>;
     const remove = db.transaction(() => {
       for (const annotation of annotationIds) {
         db.prepare("DELETE FROM annotation_comments WHERE annotation_id = ?").run(
           annotation.id,
         );
+        db.prepare("DELETE FROM question_events WHERE question_id = ?").run(annotation.id);
+        db.prepare("UPDATE annotations SET parent_id = NULL WHERE parent_id = ?").run(annotation.id);
+        db.prepare("UPDATE proposals SET question_id = NULL WHERE question_id = ?").run(annotation.id);
+        db.prepare("UPDATE decisions SET question_id = NULL WHERE question_id = ?").run(annotation.id);
       }
+      db.prepare("DELETE FROM question_events WHERE spec_id = ?").run(spec.id);
+      db.prepare("DELETE FROM proposals WHERE spec_id = ?").run(spec.id);
+      db.prepare("DELETE FROM decisions WHERE spec_id = ?").run(spec.id);
+      db.prepare("DELETE FROM research WHERE spec_id = ?").run(spec.id);
+      db.prepare("DELETE FROM spec_messages WHERE spec_id = ?").run(spec.id);
+      db.prepare("UPDATE research SET result_spec_id = NULL WHERE result_spec_id = ?").run(spec.id);
+      // Research reports are independent documents once created.
+      db.prepare("UPDATE specs SET parent_spec_id = NULL WHERE parent_spec_id = ?").run(spec.id);
       db.prepare("DELETE FROM annotations WHERE spec_id = ?").run(spec.id);
       db.prepare("DELETE FROM spec_revisions WHERE spec_id = ?").run(spec.id);
       db.prepare("DELETE FROM spec_projects WHERE spec_id = ?").run(spec.id);
@@ -1508,12 +1605,21 @@ export default async function plugin(bb: BbPluginApi) {
       db.prepare("DELETE FROM specs WHERE id = ?").run(spec.id);
     });
     remove();
-    if (chat !== undefined) {
+    textScanCache.delete(spec.id);
+    // Remove records before awaiting cleanup: late completion must not publish
+    // another report for a deleted spec.
+    const threadIds = new Set(runningResearch.map((record) => record.thread_id));
+    if (chat !== undefined) threadIds.add(chat.thread_id);
+    for (const threadId of threadIds) {
       try {
-        await bb.sdk.threads.archive({ threadId: chat.thread_id });
-        await bb.sdk.threads.stop({ threadId: chat.thread_id });
+        await bb.sdk.threads.stop({ threadId });
       } catch (error) {
-        bb.log.warn(`chat thread cleanup failed: ${String(error)}`);
+        bb.log.warn(`spec thread stop failed: ${String(error)}`);
+      }
+      try {
+        await bb.sdk.threads.archive({ threadId });
+      } catch (error) {
+        bb.log.warn(`spec thread archive failed: ${String(error)}`);
       }
     }
     publishChanged(spec.id, "deleted");
@@ -1720,6 +1826,7 @@ export default async function plugin(bb: BbPluginApi) {
       title: row.title,
       summary: row.summary,
       content: row.content,
+      icon: row.icon,
       note: row.note,
       author: row.author,
       questionId: row.question_id,
@@ -1732,10 +1839,10 @@ export default async function plugin(bb: BbPluginApi) {
     };
   }
 
-  function proposalsFor(specId: string): Proposal[] {
+  function pendingProposalsFor(specId: string): Proposal[] {
     const rows = db
       .prepare(
-        "SELECT * FROM proposals WHERE spec_id = ? ORDER BY created_at DESC LIMIT 50",
+        "SELECT * FROM proposals WHERE spec_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 50",
       )
       .all(specId) as ProposalRecord[];
     return rows.map(proposalFrom);
@@ -1743,23 +1850,31 @@ export default async function plugin(bb: BbPluginApi) {
 
   function createProposal(input: {
     specId: string;
-    content: string;
+    content?: string;
     title?: string;
     summary?: string;
+    icon?: string;
+    expectedRevision?: number;
     note?: string;
     author: string;
     questionId?: string;
   }): ProposalRecord {
     const spec = findSpecById(input.specId);
     if (spec === undefined) throw new Error(`No spec with id ${input.specId}.`);
-    assertContentSize(input.content);
+    if (input.expectedRevision !== undefined && input.expectedRevision !== spec.revision) {
+      throw new RevisionConflictError(input.expectedRevision, spec);
+    }
+    if (input.questionId !== undefined) validateProposalQuestion(input.questionId, spec.id);
+    const content = input.content ?? spec.content;
+    assertContentSize(content);
     const record: ProposalRecord = {
       id: `prop_${randomUUID().slice(0, 8)}`,
       spec_id: spec.id,
       base_revision: spec.revision,
       title: input.title?.trim() ?? spec.title,
       summary: input.summary?.trim() ?? spec.summary,
-      content: input.content,
+      content,
+      icon: input.icon === undefined ? null : input.icon.trim() || "📄",
       note: input.note?.trim() ?? "",
       author: input.author,
       question_id: input.questionId ?? null,
@@ -1771,8 +1886,8 @@ export default async function plugin(bb: BbPluginApi) {
       created_at: nowIso(),
     };
     db.prepare(
-      `INSERT INTO proposals (id, spec_id, base_revision, title, summary, content, note, author, question_id, status, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+      `INSERT INTO proposals (id, spec_id, base_revision, title, summary, content, icon, note, author, question_id, status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
     ).run(
       record.id,
       record.spec_id,
@@ -1780,6 +1895,7 @@ export default async function plugin(bb: BbPluginApi) {
       record.title,
       record.summary,
       record.content,
+      record.icon,
       record.note,
       record.author,
       record.question_id,
@@ -1789,10 +1905,19 @@ export default async function plugin(bb: BbPluginApi) {
     return record;
   }
 
+  function validateProposalQuestion(questionId: string, specId: string): AnnotationRecord {
+    const question = annotationById(questionId);
+    if (question === undefined || question.kind !== "question" || question.spec_id !== specId) {
+      throw new Error(`Question ${questionId} must be a question belonging to this spec.`);
+    }
+    return question;
+  }
+
   function applyProposal(
     proposalId: string,
     actor: string,
   ): { revision: number } {
+    assertReviewAuthority(actor);
     const row = db
       .prepare("SELECT * FROM proposals WHERE id = ?")
       .get(proposalId) as ProposalRecord | undefined;
@@ -1802,6 +1927,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const spec = findSpecById(row.spec_id);
     if (spec === undefined) throw new Error(`No spec with id ${row.spec_id}.`);
+    const question = row.question_id === null ? undefined : validateProposalQuestion(row.question_id, spec.id);
     if (spec.revision !== row.base_revision) {
       db.prepare(
         "UPDATE proposals SET status = 'superseded', resolved_at = ?, resolution_note = ? WHERE id = ?",
@@ -1816,30 +1942,29 @@ export default async function plugin(bb: BbPluginApi) {
       content: row.content,
       title: row.title === "" ? undefined : row.title,
       summary: row.summary,
+      icon: row.icon ?? undefined,
+      expectedRevision: row.base_revision,
       author: actor,
     });
     db.prepare(
       "UPDATE proposals SET status = 'applied', resolved_by = ?, resolved_at = ?, applied_revision = ? WHERE id = ?",
     ).run(actor, nowIso(), updated.revision, proposalId);
-    if (row.question_id !== null) {
-      const question = annotationById(row.question_id);
-      if (question !== undefined) {
-        db.prepare(
-          "UPDATE annotations SET folded_revision = ?, updated_at = ? WHERE id = ?",
-        ).run(updated.revision, nowIso(), question.id);
-        db.prepare("UPDATE decisions SET revision = ? WHERE question_id = ?").run(
-          updated.revision,
-          question.id,
-        );
-        recordQuestionEvent(
-          question.id,
-          spec.id,
-          "applied",
-          actor,
-          `Decision applied in v${updated.revision}`,
-          updated.revision,
-        );
-      }
+    if (question !== undefined) {
+      db.prepare(
+        "UPDATE annotations SET folded_revision = ?, updated_at = ? WHERE id = ?",
+      ).run(updated.revision, nowIso(), question.id);
+      db.prepare("UPDATE decisions SET revision = ? WHERE question_id = ?").run(
+        updated.revision,
+        question.id,
+      );
+      recordQuestionEvent(
+        question.id,
+        spec.id,
+        "applied",
+        actor,
+        `Decision applied in v${updated.revision}`,
+        updated.revision,
+      );
     }
     publishChanged(spec.id, "proposal-applied");
     return { revision: updated.revision };
@@ -1850,6 +1975,7 @@ export default async function plugin(bb: BbPluginApi) {
     note: string,
     actor: string,
   ): void {
+    assertReviewAuthority(actor);
     const row = db
       .prepare("SELECT * FROM proposals WHERE id = ?")
       .get(proposalId) as ProposalRecord | undefined;
@@ -2190,9 +2316,13 @@ export default async function plugin(bb: BbPluginApi) {
     return { threadId: chat.threadId };
   }
 
-  function ackAgentChange(specId: string, revision: number): void {
+  function ackAgentChange(specId: string, revision: number, actor: string): void {
+    assertReviewAuthority(actor);
     const spec = findSpecById(specId);
     if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
+    if (!Number.isInteger(revision) || revision < 1 || revision > spec.revision) {
+      throw new Error(`Acknowledged revision must be between 1 and ${spec.revision}.`);
+    }
     db.prepare("UPDATE specs SET acked_revision = ? WHERE id = ?").run(
       revision,
       specId,
@@ -2205,6 +2335,7 @@ export default async function plugin(bb: BbPluginApi) {
     toRevision: number,
     actor: string,
   ): { revision: number } {
+    assertReviewAuthority(actor);
     const source = db
       .prepare(
         "SELECT title, summary, content FROM spec_revisions WHERE spec_id = ? AND revision = ?",
@@ -2230,8 +2361,10 @@ export default async function plugin(bb: BbPluginApi) {
     brief: string,
     actor: string,
   ): Promise<ResearchRecord> {
+    mustFindSpec(spec.id);
     const links = linksFor(spec.id);
     const projectId = links[0]?.projectId ?? (await personalProjectId());
+    mustFindSpec(spec.id);
     const environment =
       links[0] === undefined
         ? ({ type: "host", workspace: { type: "personal" } } as const)
@@ -2252,6 +2385,9 @@ export default async function plugin(bb: BbPluginApi) {
       title: `Research: ${truncate(brief, 60)}`,
       pluginMetadata: { specId: spec.id, researchBrief: brief },
     });
+    if (findSpecById(spec.id) === undefined) {
+      await discardThreadForDeletedSpec(spec.id, thread.id);
+    }
     db.prepare(
       "INSERT OR REPLACE INTO thread_specs (thread_id, spec_id, mode, created_at) VALUES (?, ?, 'attached', ?)",
     ).run(thread.id, spec.id, nowIso());
@@ -2276,31 +2412,37 @@ export default async function plugin(bb: BbPluginApi) {
     return record;
   }
 
-  async function finalizeResearch(
+  function finalizeResearch(
     record: ResearchRecord,
     status: "done" | "failed" | "cancelled",
     output: string | null,
     error: string,
-  ): Promise<void> {
-    let resultSpecId: string | null = null;
-    if (status === "done" && output !== null && output.trim() !== "") {
+  ): void {
+    const finalize = db.transaction(() => {
+      const current = runningResearchForThread(record.thread_id);
       const parent = findSpecById(record.spec_id);
-      const result = createSpec({
-        title: truncate(record.brief, 80) || "Research",
-        summary:
-          parent === undefined ? "Research result" : `Research for ${parent.title}`,
-        content: output.trim(),
-        icon: "🔬",
-        projectIds: parent === undefined ? [] : projectIdsFor(parent.id),
-        ...(parent === undefined ? {} : { parentSpecId: parent.id }),
-        author: "agent",
-      });
-      resultSpecId = result.id;
-    }
-    db.prepare(
-      "UPDATE research SET status = ?, result_spec_id = ?, error = ?, updated_at = ? WHERE id = ?",
-    ).run(status, resultSpecId, error, nowIso(), record.id);
-    publishChanged(record.spec_id, `research-${status}`);
+      // Event delivery and reconciliation may both have awaited the output.
+      // Recheck inside the transaction, including deletion of the parent.
+      if (current?.id !== record.id || parent === undefined) return false;
+      let resultSpecId: string | null = null;
+      if (status === "done" && output !== null && output.trim() !== "") {
+        const result = createSpec({
+          title: truncate(record.brief, 80) || "Research",
+          summary: `Research for ${parent.title}`,
+          content: output.trim(),
+          icon: "🔬",
+          projectIds: projectIdsFor(parent.id),
+          parentSpecId: parent.id,
+          author: "agent",
+        });
+        resultSpecId = result.id;
+      }
+      db.prepare(
+        "UPDATE research SET status = ?, result_spec_id = ?, error = ?, updated_at = ? WHERE id = ?",
+      ).run(status, resultSpecId, error, nowIso(), record.id);
+      return true;
+    });
+    if (finalize()) publishChanged(record.spec_id, `research-${status}`);
   }
 
   function runningResearchForThread(threadId: string): ResearchRecord | undefined {
@@ -2316,16 +2458,16 @@ export default async function plugin(bb: BbPluginApi) {
     const record = runningResearchForThread(threadId);
     if (record === undefined) return;
     if (failure !== null) {
-      await finalizeResearch(record, "failed", null, failure);
+      finalizeResearch(record, "failed", null, failure);
       return;
     }
     const output = await bb.sdk.threads.output({ threadId });
     const text = output.output;
     if (text === null || text.trim() === "") {
-      await finalizeResearch(record, "failed", null, "The run produced no output.");
+      finalizeResearch(record, "failed", null, "The run produced no output.");
       return;
     }
-    await finalizeResearch(record, "done", text, "");
+    finalizeResearch(record, "done", text, "");
   }
 
   async function reconcileResearch(specId: string): Promise<void> {
@@ -2335,8 +2477,13 @@ export default async function plugin(bb: BbPluginApi) {
     for (const record of running) {
       try {
         const thread = await bb.sdk.threads.get({ threadId: record.thread_id });
-        const status = thread?.status;
-        if (status === "idle") {
+        if (thread === null || thread === undefined || thread.deletedAt !== null) {
+          finalizeResearch(record, "cancelled", null, "The research thread was deleted.");
+        } else if (thread.archivedAt !== null) {
+          finalizeResearch(record, "cancelled", null, "The research thread was archived.");
+        } else if (thread.status === "error") {
+          finalizeResearch(record, "failed", null, "The research thread failed.");
+        } else if (thread.status === "idle") {
           await completeResearchFromThread(record.thread_id, null);
         }
       } catch (error) {
@@ -2407,7 +2554,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     for (const row of projectRows) {
-      if (row.mode === "pinned" || detached.has(row.spec_id)) continue;
+      if (row.mode !== "auto" || detached.has(row.spec_id)) continue;
       const spec = findSpecById(row.spec_id);
       if (spec === undefined) continue;
       const seen = lastRead(threadId, spec.id);
@@ -2700,9 +2847,7 @@ export default async function plugin(bb: BbPluginApi) {
           );
         }
       }
-      const pendingProposals = proposalsFor(spec.id).filter(
-        (proposal) => proposal.status === "pending",
-      );
+      const pendingProposals = pendingProposalsFor(spec.id);
       if (pendingProposals.length > 0) {
         parts.push("", "## Pending proposals (the user reviews and applies them)");
         for (const proposal of pendingProposals.slice(0, 10)) {
@@ -2824,37 +2969,23 @@ export default async function plugin(bb: BbPluginApi) {
     execute: ({ idOrSlug, content, title, summary, icon, expectedRevision, questionId }, ctx) => {
       try {
         const spec = mustFindSpec(idOrSlug);
-        if (
-          content === undefined &&
-          title === undefined &&
-          summary === undefined &&
-          icon === undefined
-        ) {
-          return toolError("Provide at least one of content, title, summary, or icon.");
-        }
-        if (config.agentWriteMode === "propose" && content !== undefined) {
-          const proposal = createProposal({
-            specId: spec.id,
-            content,
-            ...(title === undefined ? {} : { title }),
-            ...(summary === undefined ? {} : { summary }),
-            note: "Agent-proposed change awaiting review",
-            author: "agent",
-            ...(questionId === undefined ? {} : { questionId }),
-          });
-          return toolText(
-            `Created proposal ${proposal.id} against v${proposal.base_revision}. The user reviews and applies it in the Specs page; record the decision with specs_resolve and mention the proposal, and the applied revision links back automatically.`,
-          );
-        }
-        const updated = saveSpec({
+        const result = writeSpec({
           id: spec.id,
           content,
           title,
           summary,
           icon,
           expectedRevision,
+          questionId,
           author: "agent",
         });
+        if ("proposal" in result) {
+          const proposal = result.proposal;
+          return toolText(
+            `Created proposal ${proposal.id} against v${proposal.base_revision}. The user reviews and applies it in the Specs page; record the decision with specs_resolve and mention the proposal, and the applied revision links back automatically.`,
+          );
+        }
+        const updated = result.spec;
         recordRead(ctx.threadId, updated.id, updated.revision);
         return toolText(
           `Updated "${updated.title}" (${updated.slug}) to revision ${updated.revision}.`,
@@ -2868,7 +2999,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "specs_propose",
     description:
-      "Propose a spec change for the user to review instead of writing it. The Specs page shows the proposal as a diff with Apply / Reject.",
+      "Propose a spec change for the user to review instead of writing it. Pass expectedRevision from the latest specs_read to reject stale proposals. The Specs page shows the proposal as a diff with Apply / Reject.",
     instructions:
       "Use specs_propose when a change should be owned by the user; link it to the question it answers with questionId.",
     presentation: {
@@ -2881,14 +3012,18 @@ export default async function plugin(bb: BbPluginApi) {
       title: z.string().min(1).max(200).optional(),
       summary: z.string().max(500).optional(),
       note: z.string().max(1000).optional().describe("One line on what changed and why."),
+      icon: z.string().max(16).optional(),
+      expectedRevision: z.number().int().optional(),
       questionId: z.string().optional(),
     }),
-    execute: ({ idOrSlug, content, title, summary, note, questionId }) => {
+    execute: ({ idOrSlug, content, title, summary, icon, note, expectedRevision, questionId }) => {
       try {
         const spec = mustFindSpec(idOrSlug);
         const proposal = createProposal({
           specId: spec.id,
           content,
+          icon,
+          expectedRevision,
           ...(title === undefined ? {} : { title }),
           ...(summary === undefined ? {} : { summary }),
           ...(note === undefined ? {} : { note }),
@@ -3410,6 +3545,21 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.warn(`research failure handling failed: ${String(failure)}`);
     });
   });
+  for (const event of ["thread.archived", "thread.deleted"] as const) {
+    bb.events.on(event, ({ thread }) => {
+      const record = runningResearchForThread(thread.id);
+      if (record !== undefined) {
+        finalizeResearch(
+          record,
+          "cancelled",
+          null,
+          event === "thread.archived"
+            ? "The research thread was archived."
+            : "The research thread was deleted.",
+        );
+      }
+    });
+  }
 
   bb.agents.configure((context) => {
     try {
@@ -3516,9 +3666,7 @@ export default async function plugin(bb: BbPluginApi) {
           source: question.source,
         })),
         textDecisions: scan.decisions,
-        proposals: proposalsFor(spec.id).filter(
-          (proposal) => proposal.status === "pending",
-        ),
+        proposals: pendingProposalsFor(spec.id),
         decisions: decisionsFor({ specId: spec.id, limit: 100 }),
         research: researchFor(spec.id),
         discussion: specMessagesFor(spec.id, 50),
@@ -3684,7 +3832,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     specs_ack_agent_change: ({ id, revision }) => {
-      ackAgentChange(id, revision);
+      ackAgentChange(id, revision, "user");
       return { ok: true as const };
     },
 
@@ -3901,7 +4049,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb specs search <query> [--json]",
     "  bb specs read <id-or-slug> [--json]",
     "  bb specs create <title> [--project <id>] [--mode pinned|auto|available] [--summary <text>] [--file <path>] [--json]",
-    "  bb specs write <id-or-slug> [--file <path>|--content <text>] [--title <t>] [--summary <s>] [--expected-revision <n>] [--json]",
+    "  bb specs write <id-or-slug> [--file <path>|--content <text>] [--title <t>] [--summary <s>] [--icon <emoji>] [--expected-revision <n>] [--json]",
     "  bb specs attach <id-or-slug> [--thread <thread-id>] [--json]",
     "  bb specs detach <id-or-slug> [--thread <thread-id>] [--json]",
     "  bb specs link <id-or-slug> --project <id> [--mode pinned|auto|available] [--json]",
@@ -3914,7 +4062,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb specs clarify <annotation-id> <follow-up question> [--json]",
     "  bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]",
     "  bb specs dismiss <annotation-id> [--reason <text>] [--json]",
-    "  bb specs propose <id-or-slug> [--file <path>|--content <text>] [--note <text>] [--question <annotation-id>] [--json]",
+    "  bb specs propose <id-or-slug> [--file <path>|--content <text>] [--note <text>] [--question <annotation-id>] [--expected-revision <n>] [--json]",
     "  bb specs proposals <id-or-slug> [--json]",
     "  bb specs apply <proposal-id> [--json]",
     "  bb specs reject <proposal-id> [--note <text>] [--json]",
@@ -3959,7 +4107,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "clarify", summary: "Ask a follow-up question", usage: "bb specs clarify <annotation-id> <follow-up question> [--json]" },
       { name: "resolve-question", summary: "Close a question with a decision", usage: "bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]" },
       { name: "dismiss", summary: "Drop a question without deciding", usage: "bb specs dismiss <annotation-id> [--reason <text>] [--json]" },
-      { name: "propose", summary: "Propose a spec change for review", usage: "bb specs propose <id-or-slug> [--file <path>|--content <text>] [--note <text>] [--json]" },
+      { name: "propose", summary: "Propose a spec change for review", usage: "bb specs propose <id-or-slug> [--file <path>|--content <text>] [--note <text>] [--expected-revision <n>] [--json]" },
       { name: "proposals", summary: "List proposals for a spec", usage: "bb specs proposals <id-or-slug> [--json]" },
       { name: "apply", summary: "Apply a pending proposal", usage: "bb specs apply <proposal-id> [--json]" },
       { name: "reject", summary: "Reject a pending proposal", usage: "bb specs reject <proposal-id> [--note <text>] [--json]" },
@@ -4055,7 +4203,7 @@ export default async function plugin(bb: BbPluginApi) {
             const content =
               file === undefined ? undefined : await readInvocationFile(ctx, file);
             const projectId = flagString("project") ?? ctx.projectId;
-            const mode = flagString("mode") as LinkMode | undefined;
+            const mode = linkModeSchema.optional().parse(flags.get("mode"));
             const spec = createSpec({
               title,
               ...(flagString("summary") === undefined
@@ -4066,7 +4214,7 @@ export default async function plugin(bb: BbPluginApi) {
                 : { icon: flagString("icon") }),
               ...(content === undefined ? {} : { content }),
               projectIds: projectId === undefined ? [] : [projectId],
-              author: "cli",
+              author: ctx.threadId === undefined ? "cli" : "agent",
               ...(mode === undefined ? {} : { mode }),
             });
             if (json) return reply(specSummary(spec), "");
@@ -4086,10 +4234,10 @@ export default async function plugin(bb: BbPluginApi) {
               file !== undefined
                 ? await readInvocationFile(ctx, file)
                 : inline;
-            const expectedRaw = flagString("expected-revision");
+            const expectedRaw = flags.get("expected-revision");
             const expectedRevision =
-              expectedRaw === undefined ? undefined : Number.parseInt(expectedRaw, 10);
-            const updated = saveSpec({
+              expectedRaw === undefined ? undefined : z.number().int().positive().parse(Number(z.string().parse(expectedRaw)));
+            const result = writeSpec({
               id: spec.id,
               ...(content === undefined ? {} : { content }),
               ...(flagString("title") === undefined
@@ -4101,11 +4249,18 @@ export default async function plugin(bb: BbPluginApi) {
               ...(flagString("icon") === undefined
                 ? {}
                 : { icon: flagString("icon") }),
-              ...(expectedRevision === undefined || Number.isNaN(expectedRevision)
-                ? {}
-                : { expectedRevision }),
-              author: "cli",
+              expectedRevision,
+              questionId: flagString("question"),
+              author: ctx.threadId === undefined ? "cli" : "agent",
             });
+            if ("proposal" in result) {
+              const proposal = result.proposal;
+              return reply(
+                { ok: true, id: proposal.id, baseRevision: proposal.base_revision },
+                `Created proposal ${proposal.id} against v${proposal.base_revision}; the user reviews and applies it in the Specs page.`,
+              );
+            }
+            const updated = result.spec;
             if (ctx.threadId !== undefined) {
               recordRead(ctx.threadId, updated.id, updated.revision);
             }
@@ -4144,7 +4299,7 @@ export default async function plugin(bb: BbPluginApi) {
                 "DELETE FROM spec_projects WHERE spec_id = ? AND project_id = ?",
               ).run(spec.id, projectId);
             } else {
-              const mode = (flagString("mode") ?? "auto") as LinkMode;
+              const mode = linkModeSchema.parse(flags.get("mode") ?? "auto");
               db.prepare(
                 "INSERT OR REPLACE INTO spec_projects (spec_id, project_id, mode, created_at) VALUES (?, ?, ?, ?)",
               ).run(spec.id, projectId, mode, nowIso());
@@ -4204,9 +4359,12 @@ export default async function plugin(bb: BbPluginApi) {
             const content =
               file !== undefined ? await readInvocationFile(ctx, file) : inline;
             if (content === undefined) return fail("Provide --file or --content.");
+            const expectedRaw = flags.get("expected-revision");
             const proposal = createProposal({
               specId: spec.id,
               content,
+              icon: flagString("icon"),
+              expectedRevision: expectedRaw === undefined ? undefined : z.number().int().positive().parse(Number(z.string().parse(expectedRaw))),
               ...(flagString("title") === undefined
                 ? {}
                 : { title: flagString("title") }),
@@ -4255,7 +4413,7 @@ export default async function plugin(bb: BbPluginApi) {
             if (proposalId === undefined) return fail(usage);
             const result = applyProposal(
               proposalId,
-              ctx.threadId === undefined ? "cli" : "user",
+              ctx.threadId === undefined ? "cli" : "agent",
             );
             return reply(
               { ok: true, ...result },
@@ -4269,7 +4427,7 @@ export default async function plugin(bb: BbPluginApi) {
             rejectProposal(
               proposalId,
               flagString("note") ?? rest.slice(1).join(" ").trim(),
-              ctx.threadId === undefined ? "cli" : "user",
+              ctx.threadId === undefined ? "cli" : "agent",
             );
             return reply({ ok: true, proposalId }, `Rejected ${proposalId}.`);
           }
@@ -4372,7 +4530,7 @@ export default async function plugin(bb: BbPluginApi) {
             const result = revertToRevision(
               spec.id,
               toRevision,
-              ctx.threadId === undefined ? "cli" : "user",
+              ctx.threadId === undefined ? "cli" : "agent",
             );
             return reply(
               { ok: true, ...result },
@@ -4387,7 +4545,7 @@ export default async function plugin(bb: BbPluginApi) {
             const spec = mustFindSpec(idOrSlug);
             const revision = Number.parseInt(revisionRaw, 10);
             if (Number.isNaN(revision)) return fail(usage);
-            ackAgentChange(spec.id, revision);
+            ackAgentChange(spec.id, revision, ctx.threadId === undefined ? "cli" : "agent");
             return reply({ ok: true }, `Acknowledged v${revision}.`);
           }
 
@@ -4472,7 +4630,7 @@ export default async function plugin(bb: BbPluginApi) {
             const text = rest.slice(1).join(" ").trim();
             if (idOrSlug === undefined || text === "") return fail(usage);
             const spec = mustFindSpec(idOrSlug);
-            const result = promoteTextQuestion(spec.id, text, "cli");
+            const result = promoteTextQuestion(spec.id, text, ctx.threadId === undefined ? "cli" : "agent");
             return reply(
               { ok: true, ...result },
               `Promoted to ${result.annotationId}; spec is now at revision ${result.revision}.`,
@@ -4566,6 +4724,9 @@ export default async function plugin(bb: BbPluginApi) {
             const annotation = annotationById(annotationId);
             if (annotation === undefined) {
               return fail(`No annotation with id ${annotationId}.`);
+            }
+            if (annotation.kind === "question") {
+              return fail("Use resolve-question or dismiss to change a question's state.");
             }
             db.prepare(
               "UPDATE annotations SET status = 'resolved', updated_at = ? WHERE id = ?",

@@ -15,6 +15,7 @@ import { ContentEditable } from "@lexical/react/LexicalContentEditable";
 import { HistoryPlugin } from "@lexical/react/LexicalHistoryPlugin";
 import { ListPlugin } from "@lexical/react/LexicalListPlugin";
 import { LinkPlugin } from "@lexical/react/LexicalLinkPlugin";
+import { HorizontalRulePlugin } from "@lexical/react/LexicalHorizontalRulePlugin";
 import { MarkdownShortcutPlugin } from "@lexical/react/LexicalMarkdownShortcutPlugin";
 import { OnChangePlugin } from "@lexical/react/LexicalOnChangePlugin";
 import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
@@ -36,6 +37,8 @@ import {
   ListNode,
 } from "@lexical/list";
 import {
+  $createHorizontalRuleNode,
+  $isHorizontalRuleNode,
   INSERT_HORIZONTAL_RULE_COMMAND,
   HorizontalRuleNode,
 } from "@lexical/react/LexicalHorizontalRuleNode";
@@ -45,6 +48,7 @@ import {
   $convertFromMarkdownString,
   $convertToMarkdownString,
   TRANSFORMERS,
+  type ElementTransformer,
 } from "@lexical/markdown";
 import {
   $createParagraphNode,
@@ -63,6 +67,16 @@ const EDITOR_THEME = {
   code: "specs-code-block",
   quote: "specs-quote-block",
 };
+
+const HORIZONTAL_RULE: ElementTransformer = {
+  dependencies: [HorizontalRuleNode],
+  type: "element",
+  regExp: /^\s*(?:---+|\*\*\*+|___+)\s*$/,
+  export: (node) => $isHorizontalRuleNode(node) ? "---" : null,
+  replace: (node) => { node.replace($createHorizontalRuleNode()); },
+};
+
+export const MARKDOWN_TRANSFORMERS = [HORIZONTAL_RULE, ...TRANSFORMERS];
 
 function setBlock(editor: LexicalEditor, create: () => ElementNode): void {
   editor.update(() => {
@@ -281,7 +295,7 @@ function MarkdownChanges({
   const handle = useCallback(
     (editorState: EditorState) => {
       editorState.read(() => {
-        const markdown = $convertToMarkdownString(TRANSFORMERS);
+        const markdown = $convertToMarkdownString(MARKDOWN_TRANSFORMERS);
         // Safety: an editor that failed to load its initial content serializes
         // as empty. Never let that first empty change overwrite the document.
         if (markdown.trim() === "" && !sawContent.current) return;
@@ -322,7 +336,7 @@ export function MarkdownEditor({
           HorizontalRuleNode,
         ],
         editorState: () => {
-          $convertFromMarkdownString(value, TRANSFORMERS);
+          $convertFromMarkdownString(value, MARKDOWN_TRANSFORMERS);
         },
         onError: (error: Error) => {
           // Keep editor failures contained; the rest of the page still works.
@@ -360,7 +374,8 @@ export function MarkdownEditor({
         <HistoryPlugin />
         <ListPlugin />
         <LinkPlugin />
-        <MarkdownShortcutPlugin transformers={TRANSFORMERS} />
+        <HorizontalRulePlugin />
+        <MarkdownShortcutPlugin transformers={MARKDOWN_TRANSFORMERS} />
         <SlashMenu />
         <MarkdownChanges onChange={onChange} initialMarkdown={value} />
       </div>

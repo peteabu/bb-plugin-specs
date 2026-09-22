@@ -51,6 +51,8 @@ import {
   focusSpecEditor,
 } from "@/components/ui/markdown-editor";
 import { cn } from "@/lib/utils";
+import { useSpecDraft } from "@/hooks/use-spec-draft";
+import { captureSelection, findAnnotationRange, type QuoteLocation } from "./lib/annotations";
 import "./app.css";
 
 // ---------------------------------------------------------------------------
@@ -98,12 +100,6 @@ const SPEC_EMOJIS = [
 const HIGHLIGHT_NAME = "specs-annotation";
 const highlightOwner: { token: object | null } = { token: null };
 
-interface QuoteLocation {
-  quote: string;
-  prefix: string;
-  suffix: string;
-}
-
 interface SelectionMenu extends QuoteLocation {
   x: number;
   y: number;
@@ -112,100 +108,6 @@ interface SelectionMenu extends QuoteLocation {
 interface AnnotationDraft extends SelectionMenu {
   body: string;
   kind: "note" | "question";
-}
-
-function collectTextNodes(container: HTMLElement): Text[] {
-  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-  const nodes: Text[] = [];
-  let node = walker.nextNode();
-  while (node !== null) {
-    nodes.push(node as Text);
-    node = walker.nextNode();
-  }
-  return nodes;
-}
-
-function normalizeQuote(value: string): string {
-  return value.replace(/\s+/gu, " ").trim();
-}
-
-// Rendered markdown can differ from stored quotes in whitespace (soft line
-// breaks, indentation), and quotes can repeat. Normalize both sides and map
-// offsets back to real text nodes so ranges stay exact.
-function normalizeTextNodes(nodes: Text[]): {
-  text: string;
-  positions: Array<{ node: Text; offset: number }>;
-} {
-  let text = "";
-  const positions: Array<{ node: Text; offset: number }> = [];
-  let pendingSpace: { node: Text; offset: number } | null = null;
-  for (const node of nodes) {
-    const data = node.data;
-    for (let index = 0; index < data.length; index += 1) {
-      const char = data[index] ?? "";
-      if (/\s/u.test(char)) {
-        if (pendingSpace === null) pendingSpace = { node, offset: index };
-        continue;
-      }
-      if (pendingSpace !== null) {
-        if (text !== "" && !text.endsWith(" ")) {
-          text += " ";
-          positions.push(pendingSpace);
-        }
-        pendingSpace = null;
-      }
-      text += char;
-      positions.push({ node, offset: index });
-    }
-  }
-  return { text, positions };
-}
-
-function locateQuote(text: string, annotation: QuoteLocation): number {
-  const quote = normalizeQuote(annotation.quote);
-  if (quote === "") return -1;
-  const prefix = normalizeQuote(annotation.prefix);
-  const suffix = normalizeQuote(annotation.suffix);
-  const candidates: number[] = [];
-  let at = text.indexOf(quote);
-  while (at !== -1) {
-    candidates.push(at);
-    at = text.indexOf(quote, at + 1);
-    if (candidates.length > 24) break;
-  }
-  if (candidates.length <= 1) return candidates[0] ?? -1;
-  for (const candidate of candidates) {
-    const before = text
-      .slice(Math.max(0, candidate - prefix.length - 1), candidate)
-      .trim();
-    const after = text
-      .slice(candidate + quote.length + 1, candidate + quote.length + 1 + suffix.length)
-      .trim();
-    if (
-      (prefix === "" || before.endsWith(prefix)) &&
-      (suffix === "" || after.startsWith(suffix))
-    ) {
-      return candidate;
-    }
-  }
-  return candidates[0] ?? -1;
-}
-
-function findAnnotationRange(
-  container: HTMLElement,
-  annotation: QuoteLocation,
-): Range | null {
-  const { text, positions } = normalizeTextNodes(collectTextNodes(container));
-  const quoteStart = locateQuote(text, annotation);
-  if (quoteStart === -1) return null;
-  const quote = normalizeQuote(annotation.quote);
-  const start = positions[quoteStart];
-  const end = positions[quoteStart + quote.length - 1];
-  if (start === undefined || end === undefined) return null;
-  const range = document.createRange();
-  range.setStart(start.node, start.offset);
-  range.setEnd(end.node, end.offset + 1);
-  return range;
 }
 
 function applyDomHighlights(container: HTMLElement, ranges: Range[]): () => void {
@@ -265,25 +167,6 @@ function useAnnotationHighlights(
     }
     return applyDomHighlights(container, ranges);
   }, [containerRef, annotations, revisionKey]);
-}
-
-function captureSelection(container: HTMLElement): QuoteLocation | null {
-  const selection = window.getSelection();
-  if (selection === null || selection.isCollapsed || selection.rangeCount === 0) {
-    return null;
-  }
-  const range = selection.getRangeAt(0);
-  if (!container.contains(range.commonAncestorContainer)) return null;
-  const quote = normalizeQuote(selection.toString());
-  if (quote === "") return null;
-  const { text } = normalizeTextNodes(collectTextNodes(container));
-  const at = text.indexOf(quote);
-  return {
-    quote: quote.slice(0, 1900),
-    prefix: at === -1 ? "" : text.slice(Math.max(0, at - 48), at),
-    suffix:
-      at === -1 ? "" : text.slice(at + quote.length, at + quote.length + 48),
-  };
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +310,7 @@ function SpecsSidebar({
   );
 
   useEffect(() => {
-    const spec = specs?.find((candidate) => candidate.slug === selectedSlug);
+    const spec = specs?.find((candidate) => candidate.slug === selectedSlug || candidate.id === selectedSlug);
     if (spec === undefined) return;
     const key = spec.projectIds[0] ?? "__none__";
     setCollapsed((current) => {
@@ -523,7 +406,7 @@ function SpecsSidebar({
                 {isCollapsed
                   ? null
                   : group.specs.map((spec) => {
-                      const selected = spec.slug === selectedSlug;
+                      const selected = spec.slug === selectedSlug || spec.id === selectedSlug;
                       return (
                         <button
                           key={spec.id}
@@ -917,12 +800,14 @@ function AgentChangeCard({
 
 function ProposalCard({
   proposal,
+  current,
   busy,
   onReview,
   onApply,
   onReject,
 }: {
   proposal: Proposal;
+  current: SpecDetail["spec"];
   busy: boolean;
   onReview: () => void;
   onApply: () => void;
@@ -930,6 +815,11 @@ function ProposalCard({
 }) {
   const [rejecting, setRejecting] = useState(false);
   const [note, setNote] = useState("");
+  const metadata = [
+    { label: "Title", before: current.title, after: proposal.title || current.title },
+    { label: "Summary", before: current.summary, after: proposal.summary },
+    { label: "Icon", before: current.icon, after: proposal.icon ?? current.icon },
+  ].filter(({ before, after }) => before !== after);
   return (
     <div className="specs-hairline mb-3 rounded-xl bg-card p-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -948,6 +838,19 @@ function ProposalCard({
           Answers {proposal.questionId} — applying links the revision to its
           decision.
         </p>
+      )}
+      {metadata.length === 0 ? null : (
+        <dl className="mt-2 space-y-1 text-xs">
+          {metadata.map(({ label, before, after }) => (
+            <div key={label} className="flex gap-2">
+              <dt className="w-14 shrink-0 text-muted-foreground">{label}</dt>
+              <dd className="min-w-0 break-words">
+                <del className="text-muted-foreground">{before || "Empty"}</del>
+                {" → "}<span>{after || "Empty"}</span>
+              </dd>
+            </div>
+          ))}
+        </dl>
       )}
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
         <Button
@@ -1705,7 +1608,7 @@ function CommentsRail({
 // Specs page
 // ---------------------------------------------------------------------------
 
-function SpecsWorkspace({
+export function SpecsWorkspace({
   selectedSlug,
   tabPart,
   showSidebar,
@@ -1720,7 +1623,7 @@ function SpecsWorkspace({
   showSidebar: boolean;
   compactSidebar?: boolean;
   chrome: "route" | "panel" | "overlay";
-  onSelectSpec: (slug: string) => void;
+  onSelectSpec: (slug: string, preserveTab?: boolean) => void;
   onSelectTab: (tab: "document" | "annotations" | "chat") => void;
   onOpenThread: (threadId: string) => void;
 }) {
@@ -1731,16 +1634,12 @@ function SpecsWorkspace({
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [listError, setListError] = useState<string | null>(null);
   const [query, setQuery] = useState("");
-  const [detail, setDetail] = useState<SpecDetail | null>(null);
+  const [loadedDetail, setDetail] = useState<SpecDetail | null>(null);
+  const loadedSelectionRef = useRef(selectedSlug);
+  const detail = loadedSelectionRef.current === selectedSlug || loadedDetail?.spec.id === selectedSlug
+    ? loadedDetail : null;
   const [detailError, setDetailError] = useState<string | null>(null);
   const [rail, setRail] = useState<"none" | "comments" | "chat">("none");
-  const [editing, setEditing] = useState(false);
-  const [titleDraft, setTitleDraft] = useState("");
-  const [summaryDraft, setSummaryDraft] = useState("");
-  const [contentDraft, setContentDraft] = useState("");
-  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">(
-    "idle",
-  );
   const [creating, setCreating] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -1760,33 +1659,58 @@ function SpecsWorkspace({
   const previewRef = useRef<HTMLDivElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const detailRef = useRef<SpecDetail | null>(null);
-  const draftsRef = useRef({ title: "", summary: "", content: "" });
-  const savingRef = useRef(false);
-  const editingSpecRef = useRef<string | null>(null);
+  const selectedRef = useRef(selectedSlug);
+  const detailRequestRef = useRef(0);
+  const workspaceMountedRef = useRef(true);
+  selectedRef.current = selectedSlug;
+  detailRef.current = detail;
   const pendingCreateRef = useRef<string | null>(null);
   const focusTitleRef = useRef(false);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
 
+  useEffect(() => {
+    workspaceMountedRef.current = true;
+    return () => { workspaceMountedRef.current = false; ++detailRequestRef.current; };
+  }, []);
+
   const refetchList = useCallback(() => {
+    if (!workspaceMountedRef.current) return;
     rpc.call("specs_list", {}).then(
       (result) => {
+        if (!workspaceMountedRef.current) return;
         setSpecs(result.specs);
         setProjects(result.projects);
         setListError(null);
       },
-      (cause: unknown) => setListError(messageOf(cause)),
+      (cause: unknown) => {
+        if (workspaceMountedRef.current) setListError(messageOf(cause));
+      },
     );
   }, [rpc]);
 
   const refetchDetail = useCallback(
     (slug: string) => {
-      rpc.call("specs_get", { idOrSlug: slug }).then(
+      if (!workspaceMountedRef.current) return;
+      // A mutation started on another document must not supersede the active
+      // document's request. Once loaded, use its immutable ID across renames.
+      const current = detailRef.current;
+      const currentIsSelected = current !== null &&
+        (selectedRef.current === current.spec.id || selectedRef.current === current.spec.slug);
+      if (slug !== selectedRef.current && !(currentIsSelected && slug === current.spec.id)) return;
+      const selection = selectedRef.current;
+      const request = ++detailRequestRef.current;
+      const idOrSlug = current !== null &&
+        (slug === current.spec.id || slug === current.spec.slug)
+        ? current.spec.id : slug;
+      rpc.call("specs_get", { idOrSlug }).then(
         (result) => {
+          if (selection !== selectedRef.current || request !== detailRequestRef.current) return;
+          loadedSelectionRef.current = selection;
           setDetail(result as SpecDetail);
           setDetailError(null);
         },
         (cause: unknown) => {
-          setDetail(null);
+          if (selection !== selectedRef.current || request !== detailRequestRef.current) return;
           setDetailError(messageOf(cause));
         },
       );
@@ -1799,12 +1723,28 @@ function SpecsWorkspace({
   }, [refetchList]);
 
   useEffect(() => {
-    if (selectedSlug === "") {
+    ++detailRequestRef.current;
+    if (loadedDetail?.spec.id !== selectedSlug) {
       setDetail(null);
+      detailRef.current = null;
+    }
+    setDetailError(null);
+    if (selectedSlug === "") {
       return;
     }
     refetchDetail(selectedSlug);
   }, [selectedSlug, refetchDetail]);
+
+  const draft = useSpecDraft(detail?.spec ?? null, {
+    scope: `${chrome}:${bbContext.threadId ?? ""}`,
+    save: (input) => rpc.call("specs_save", input),
+    onSettled: (id) => {
+      refetchList();
+      if (detailRef.current?.spec.id === id) refetchDetail(id);
+    },
+  });
+  const { editing, saveState } = draft;
+  const { title: titleDraft, summary: summaryDraft, content: contentDraft } = draft.values;
 
   // Shells without a visible list (or before the user picks) open the most
   // recent spec for the current project, falling back to the most recent
@@ -1827,7 +1767,7 @@ function SpecsWorkspace({
         ? undefined
         : specs.find((spec) => spec.projectIds.includes(projectId))) ??
       specs[0];
-    if (candidate !== undefined) onSelectSpec(candidate.slug);
+    if (candidate !== undefined) onSelectSpec(candidate.id);
   }, [chrome, selectedSlug, specs, onSelectSpec, bbContext.projectId]);
 
   useEffect(() => {
@@ -1845,23 +1785,14 @@ function SpecsWorkspace({
     detail === null ? "" : `${detail.spec.id}:${detail.spec.revision}`;
   useEffect(() => {
     if (detail === null) return;
+    // Canonical navigation remains valid after a title changes its slug.
+    if (selectedSlug !== detail.spec.id) onSelectSpec(detail.spec.id, true);
     if (pendingCreateRef.current === detail.spec.id) {
       pendingCreateRef.current = null;
-      editingSpecRef.current = detail.spec.id;
-      setTitleDraft(detail.spec.title);
-      setSummaryDraft(detail.spec.summary);
-      setContentDraft(detail.spec.content);
-      setEditing(true);
+      draft.beginEdit();
       focusTitleRef.current = true;
-      return;
     }
-    if (editingSpecRef.current === detail.spec.id) return;
-    setTitleDraft(detail.spec.title);
-    setSummaryDraft(detail.spec.summary);
-    setContentDraft(detail.spec.content);
-    setEditing(false);
-    editingSpecRef.current = null;
-  }, [detailKey, detail]);
+  }, [detailKey, detail, selectedSlug, onSelectSpec]);
 
   useEffect(() => {
     if (!editing || !focusTitleRef.current) return;
@@ -1872,18 +1803,6 @@ function SpecsWorkspace({
       input.select();
     }
   }, [editing, detailKey]);
-
-  useEffect(() => {
-    detailRef.current = detail;
-  }, [detail]);
-
-  useEffect(() => {
-    draftsRef.current = {
-      title: titleDraft,
-      summary: summaryDraft,
-      content: contentDraft,
-    };
-  }, [titleDraft, summaryDraft, contentDraft]);
 
   useAnnotationHighlights(previewRef, detail?.annotations ?? [], detailKey);
 
@@ -1896,55 +1815,9 @@ function SpecsWorkspace({
     (annotation) => annotation.status === "open",
   );
 
-  const dirty =
-    editing &&
-    detail !== null &&
-    (titleDraft !== detail.spec.title ||
-      summaryDraft !== detail.spec.summary ||
-      contentDraft !== detail.spec.content);
-
-  useEffect(() => {
-    if (saveState !== "saved") return;
-    const timer = setTimeout(() => setSaveState("idle"), 2500);
-    return () => clearTimeout(timer);
-  }, [saveState]);
-
-  const save = useCallback(
-    async (options?: { silent?: boolean }) => {
-      const current = detailRef.current;
-      if (current === null || savingRef.current) return;
-      savingRef.current = true;
-      setSaveState("saving");
-      const drafts = draftsRef.current;
-      try {
-        await rpc.call("specs_save", {
-          id: current.spec.id,
-          title: drafts.title.trim() === "" ? current.spec.title : drafts.title.trim(),
-          summary: drafts.summary,
-          content: drafts.content,
-          expectedRevision: current.spec.revision,
-        });
-        setSaveState("saved");
-        if (options?.silent !== true) toast.success("Spec saved");
-        refetchList();
-        refetchDetail(selectedSlug);
-      } catch (cause) {
-        setSaveState("error");
-        toast.error(messageOf(cause));
-      } finally {
-        savingRef.current = false;
-      }
-    },
-    [rpc, refetchList, refetchDetail, selectedSlug],
-  );
-
-  useEffect(() => {
-    if (!dirty) return;
-    const timer = setTimeout(() => {
-      void save({ silent: true });
-    }, 1200);
-    return () => clearTimeout(timer);
-  }, [dirty, titleDraft, summaryDraft, contentDraft, save]);
+  const save = async () => {
+    if (await draft.save()) toast.success("Spec saved");
+  };
 
   // Dismiss floating pieces on Escape or outside press.
   useEffect(() => {
@@ -1976,35 +1849,20 @@ function SpecsWorkspace({
   }, [selectionMenu, annotationDraft]);
 
   const beginEdit = () => {
-    if (detail === null) return;
-    editingSpecRef.current = detail.spec.id;
-    setTitleDraft(detail.spec.title);
-    setSummaryDraft(detail.spec.summary);
-    setContentDraft(detail.spec.content);
-    setEditing(true);
+    draft.beginEdit();
   };
 
-  const finishEdit = () => {
-    editingSpecRef.current = null;
-    setEditing(false);
-    if (dirty) void save();
-  };
+  const finishEdit = () => void draft.finishEdit();
 
-  const cancelEdit = () => {
-    if (detail === null) return;
-    editingSpecRef.current = null;
-    setTitleDraft(detail.spec.title);
-    setSummaryDraft(detail.spec.summary);
-    setContentDraft(detail.spec.content);
-    setEditing(false);
-    setSaveState("idle");
-  };
+  const cancelEdit = () => draft.discard();
 
   const selectSpec = (slug: string) => {
     if (slug === selectedSlug) return;
-    setEditing(false);
-    editingSpecRef.current = null;
-    onSelectSpec(slug);
+    const id = specs?.find((spec) => spec.slug === slug || spec.id === slug)?.id ?? slug;
+    // Invalidate fetches immediately, before the parent renders the selection.
+    ++detailRequestRef.current;
+    selectedRef.current = id;
+    onSelectSpec(id);
   };
 
   const defaultProjectId =
@@ -2022,7 +1880,7 @@ function SpecsWorkspace({
       });
       pendingCreateRef.current = created.id;
       refetchList();
-      onSelectSpec(created.slug);
+      selectSpec(created.id);
     } catch (cause) {
       toast.error(messageOf(cause));
     } finally {
@@ -2453,7 +2311,7 @@ function SpecsWorkspace({
           <>
             <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
               {chrome === "route" || showSidebar || selectedSlug === "" ? null : (
-                <IconButton label="All specs" onClick={() => onSelectSpec("")}>
+                <IconButton label="All specs" onClick={() => selectSpec("")}>
                   <Icon name="ChevronLeft" className="size-4" />
                 </IconButton>
               )}
@@ -2461,11 +2319,11 @@ function SpecsWorkspace({
                 <select
                   aria-label="Select spec"
                   className="h-8 w-full truncate rounded-md bg-secondary/50 px-2 text-xs text-foreground"
-                  value={selectedSlug}
+                  value={detail.spec.id}
                   onChange={(event) => selectSpec(event.target.value)}
                 >
                   {(specs ?? []).map((spec) => (
-                    <option key={spec.id} value={spec.slug}>
+                    <option key={spec.id} value={spec.id}>
                       {spec.title}
                     </option>
                   ))}
@@ -2495,7 +2353,7 @@ function SpecsWorkspace({
                           ? "Not saved"
                           : "Draft"}
                   </span>
-                  <Button size="sm" variant="ghost" onClick={cancelEdit}>
+                  <Button size="sm" variant="ghost" onClick={cancelEdit} disabled={saveState === "saving"}>
                     Cancel
                   </Button>
                   <Button size="sm" onClick={finishEdit}>
@@ -2545,6 +2403,27 @@ function SpecsWorkspace({
               )}
             </div>
 
+            {editing && (draft.saveError !== null || draft.storageError) ? (
+              <div role="alert" className="border-b border-border bg-secondary px-4 py-3 text-sm">
+                <p>{draft.saveError ?? "This browser cannot store a recovery copy. Keep this window open until your draft saves."}</p>
+                {draft.saveError === null ? null : (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Your draft is retained when you switch specs or close this surface.
+                  </p>
+                )}
+                <div className="mt-2 flex gap-2">
+                  <Button size="sm" variant="outline" onClick={() => {
+                    void navigator.clipboard.writeText(`# ${titleDraft}\n\n${summaryDraft}\n\n${contentDraft}`).then(
+                      () => toast.success("Draft copied"),
+                      () => toast.error("Could not copy the draft"),
+                    );
+                  }}>Copy draft</Button>
+                  {draft.conflict ? null : <Button size="sm" onClick={() => void save()}>Retry save</Button>}
+                  <Button size="sm" variant="ghost" disabled={saveState === "saving"} onClick={cancelEdit}>Discard draft</Button>
+                </div>
+              </div>
+            ) : null}
+
             <div
               ref={scrollRef}
               onScroll={() => setSelectionMenu(null)}
@@ -2567,7 +2446,7 @@ function SpecsWorkspace({
                   <input
                     ref={titleInputRef}
                     value={titleDraft}
-                    onChange={(event) => setTitleDraft(event.target.value)}
+                    onChange={(event) => draft.update({ title: event.target.value })}
                     onKeyDown={(event) => {
                       if ((event.metaKey || event.ctrlKey) && event.key === "s") {
                         event.preventDefault();
@@ -2577,7 +2456,7 @@ function SpecsWorkspace({
                         event.preventDefault();
                         focusSpecEditor();
                       }
-                      if (event.key === "Escape") cancelEdit();
+                      if (event.key === "Escape") finishEdit();
                     }}
                     placeholder="Untitled"
                     className="w-full bg-transparent text-3xl font-semibold tracking-tight text-foreground outline-none placeholder:text-muted-foreground/40 md:text-4xl"
@@ -2595,7 +2474,7 @@ function SpecsWorkspace({
                 {editing ? (
                   <input
                     value={summaryDraft}
-                    onChange={(event) => setSummaryDraft(event.target.value)}
+                    onChange={(event) => draft.update({ summary: event.target.value })}
                     placeholder="Add a one-line summary…"
                     className="mt-2 w-full bg-transparent text-sm text-muted-foreground outline-none placeholder:text-muted-foreground/40"
                   />
@@ -2669,6 +2548,7 @@ function SpecsWorkspace({
                     )}
                     {detail.proposals.map((proposal) => (
                       <ProposalCard
+                        current={detail.spec}
                         key={proposal.id}
                         proposal={proposal}
                         busy={proposalBusy}
@@ -2706,11 +2586,11 @@ function SpecsWorkspace({
                 <div className="mt-6 border-t border-border pt-6">
                   {editing ? (
                     <MarkdownEditor
-                      key={detail.spec.id}
+                      key={`${detail.spec.id}:${draft.editorVersion}`}
                       value={contentDraft}
-                      onChange={setContentDraft}
+                      onChange={(content) => draft.update({ content })}
                       onSave={() => void save()}
-                      onEscape={cancelEdit}
+                      onEscape={finishEdit}
                     />
                   ) : detail.spec.content.trim() === "" ? (
                     <div className="rounded-xl border border-dashed border-border px-6 py-10 text-center">
@@ -3237,7 +3117,7 @@ function SpecPicker({
                 </h3>
                 <div className="mt-1.5 space-y-1">
                   {group.specs.map((spec) => {
-                    const selected = spec.slug === selectedSlug;
+                    const selected = spec.slug === selectedSlug || spec.id === selectedSlug;
                     return (
                       <button
                         key={spec.id}
@@ -3290,7 +3170,10 @@ function SpecsPage({ subPath }: { subPath: string }) {
       tabPart={tabPart}
       showSidebar
       chrome="route"
-      onSelectSpec={(slug) => navigate.toPluginPanel("specs", { subPath: slug })}
+      onSelectSpec={(slug, preserveTab) => navigate.toPluginPanel("specs", {
+        subPath: preserveTab && tabPart !== "" ? `${slug}/${tabPart}` : slug,
+        replace: preserveTab === true,
+      })}
       onSelectTab={(tab) => {
         navigate.toPluginPanel("specs", {
           subPath: tab === "document" ? slugPart : `${slugPart}/${tab}`,
@@ -3319,9 +3202,9 @@ function SpecsPanelTab({ params }: { params: unknown }) {
       showSidebar
       compactSidebar
       chrome="panel"
-      onSelectSpec={(next) => {
+      onSelectSpec={(next, preserveTab) => {
         setSlug(next);
-        setTab("document");
+        if (!preserveTab) setTab("document");
       }}
       onSelectTab={setTab}
       onOpenThread={(threadId) => navigate.toThread(threadId)}
@@ -3373,9 +3256,9 @@ function SpecsOverlay() {
           tabPart={tab}
           showSidebar
           chrome="overlay"
-          onSelectSpec={(next) => {
+          onSelectSpec={(next, preserveTab) => {
             setSlug(next);
-            setTab("document");
+            if (!preserveTab) setTab("document");
           }}
           onSelectTab={setTab}
           onOpenThread={(threadId) => {

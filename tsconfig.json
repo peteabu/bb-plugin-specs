@@ -25,6 +25,9 @@
     "app.tsx",
     "components",
     "lib",
-    "hooks"
+    "hooks",
+    "*.test.ts",
+    "tests",
+    "vitest.config.ts"
   ]
 }

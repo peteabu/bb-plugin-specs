@@ -39,6 +39,24 @@ digest is **index-only** — slug, revision, title, one-line summary — capped 
 `digestMaxRows` / `digestMaxChars`; full content is only fetched by
 `specs_read`. A 50-spec project typically injects a handful of rows.
 
+## Editing and review
+
+`agentWriteMode=propose` is the default for native agent tools and CLI commands
+run from agent threads. Content, title, summary, and icon changes create a
+proposal for the user to apply or reject. Agents cannot apply, reject,
+acknowledge, or revert changes in this mode. `agentWriteMode=direct` enables
+direct edits and retains agent attribution in revision history and the review
+banner. Human CLI commands continue to apply edits directly.
+
+Use `expectedRevision` (CLI: `--expected-revision`) with writes and proposals;
+an intervening edit rejects the submission before it changes the document or
+creates a proposal. Proposal question links must name a question on that spec.
+
+Permanent deletion removes the spec's revisions, annotations, discussions,
+proposals, decisions, and research records, and stops and archives active
+research and chat threads. Completed research reports remain as independent
+specs; their parent reference is cleared. Archived thread history is retained.
+
 ## Development
 
 ```
