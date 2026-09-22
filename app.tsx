@@ -358,6 +358,28 @@ function ErrorText({ children }: { children: ReactNode }) {
 // Sidebar
 // ---------------------------------------------------------------------------
 
+interface SpecGroup {
+  key: string;
+  label: string;
+  specs: SpecSummary[];
+}
+
+function groupSpecsByProject(
+  specs: SpecSummary[],
+  projectNames: Map<string, string>,
+): SpecGroup[] {
+  const byKey = new Map<string, SpecGroup>();
+  for (const spec of specs) {
+    const key = spec.projectIds[0] ?? "__none__";
+    const label =
+      key === "__none__" ? "No project" : (projectNames.get(key) ?? key);
+    const group = byKey.get(key) ?? { key, label, specs: [] };
+    group.specs.push(spec);
+    byKey.set(key, group);
+  }
+  return [...byKey.values()].sort((a, b) => a.label.localeCompare(b.label));
+}
+
 function SpecsSidebar({
   specs,
   projects,
@@ -393,21 +415,10 @@ function SpecsSidebar({
     });
   }, [specs, query]);
 
-  const groups = useMemo(() => {
-    const byKey = new Map<
-      string,
-      { key: string; label: string; specs: SpecSummary[] }
-    >();
-    for (const spec of visible) {
-      const key = spec.projectIds[0] ?? "__none__";
-      const label =
-        key === "__none__" ? "No project" : (projectNames.get(key) ?? key);
-      const group = byKey.get(key) ?? { key, label, specs: [] };
-      group.specs.push(spec);
-      byKey.set(key, group);
-    }
-    return [...byKey.values()].sort((a, b) => a.label.localeCompare(b.label));
-  }, [visible, projectNames]);
+  const groups = useMemo(
+    () => groupSpecsByProject(visible, projectNames),
+    [visible, projectNames],
+  );
 
   useEffect(() => {
     const spec = specs?.find((candidate) => candidate.slug === selectedSlug);
@@ -1969,7 +1980,7 @@ function SpecsWorkspace({
       });
       pendingCreateRef.current = created.id;
       refetchList();
-      navigate.toPluginPanel("specs", { subPath: created.slug });
+      onSelectSpec(created.slug);
     } catch (cause) {
       toast.error(messageOf(cause));
     } finally {
@@ -3098,41 +3109,45 @@ function SpecPicker({
     [projects],
   );
   const [query, setQuery] = useState("");
-  const visible = (specs ?? []).filter((spec) => {
+  const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (needle === "") return true;
-    return `${spec.title} ${spec.slug} ${spec.summary}`
-      .toLowerCase()
-      .includes(needle);
-  });
+    if (needle === "") return specs ?? [];
+    return (specs ?? []).filter((spec) =>
+      `${spec.title} ${spec.slug} ${spec.summary}`.toLowerCase().includes(needle),
+    );
+  }, [specs, query]);
+  const groups = useMemo(
+    () => groupSpecsByProject(visible, projectNames),
+    [visible, projectNames],
+  );
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className="border-b border-border p-3">
+    <div className="specs-scroll min-h-0 flex-1 overflow-y-auto">
+      <div className="mx-auto w-full max-w-2xl px-4 pb-16 pt-10">
         <div className="flex items-center gap-2">
           <div className="relative min-w-0 flex-1">
             <Icon
               name="Search"
-              className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+              className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground"
             />
             <Input
               value={query}
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search specs"
-              className="h-8 bg-secondary/50 pl-8 text-xs"
+              className="h-10 bg-secondary/50 pl-9 text-sm"
               autoFocus
             />
           </div>
-          <Button size="sm" className="h-8 shrink-0 px-2.5" onClick={onNew}>
-            <Icon name="Plus" className="size-3.5" />
+          <Button size="sm" className="h-10 shrink-0 px-3.5" onClick={onNew}>
+            <Icon name="Plus" className="size-4" />
             New
           </Button>
         </div>
-      </div>
-      <div className="specs-scroll min-h-0 flex-1 space-y-1 overflow-y-auto p-2">
+
         {specs === null ? (
-          <p className="p-2 text-sm text-muted-foreground">Loading…</p>
+          <p className="mt-6 text-sm text-muted-foreground">Loading…</p>
         ) : visible.length === 0 ? (
-          <div className="p-1">
+          <div className="mt-6">
             <EmptyState>
               {specs.length === 0
                 ? "No specs yet. Create one, or let an agent call specs_create."
@@ -3140,41 +3155,54 @@ function SpecPicker({
             </EmptyState>
           </div>
         ) : (
-          visible.map((spec) => {
-            const selected = spec.slug === selectedSlug;
-            const projectLabel = spec.projectIds
-              .map((id) => projectNames.get(id) ?? id)
-              .join(", ");
-            return (
-              <button
-                key={spec.id}
-                type="button"
-                onClick={() => onSelect(spec.slug)}
-                className={cn(
-                  "specs-row flex w-full items-center gap-2 rounded-md px-2 py-2 text-left",
-                  selected
-                    ? "bg-state-active text-foreground"
-                    : "text-foreground/90 hover:bg-state-hover",
-                )}
-              >
-                <span className="w-5 shrink-0 text-center text-sm leading-none">
-                  {spec.icon}
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px]">{spec.title}</span>
-                  <span className="block truncate text-[11px] text-muted-foreground tabular-nums">
-                    {projectLabel === "" ? "unlinked" : projectLabel} · v
-                    {spec.revision} · {relativeTime(spec.updatedAt)}
+          <div className="mt-6 space-y-5">
+            {groups.map((group) => (
+              <section key={group.key}>
+                <h3 className="flex items-center gap-2 px-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                  <span className="min-w-0 truncate">{group.label}</span>
+                  <span className="tabular-nums opacity-70">
+                    {group.specs.length}
                   </span>
-                </span>
-                {spec.openAnnotations > 0 ? (
-                  <span className="shrink-0 rounded-full bg-primary/15 px-1.5 text-[10px] text-primary tabular-nums">
-                    {spec.openAnnotations}
-                  </span>
-                ) : null}
-              </button>
-            );
-          })
+                </h3>
+                <div className="mt-1.5 space-y-1">
+                  {group.specs.map((spec) => {
+                    const selected = spec.slug === selectedSlug;
+                    return (
+                      <button
+                        key={spec.id}
+                        type="button"
+                        onClick={() => onSelect(spec.slug)}
+                        className={cn(
+                          "specs-row group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left",
+                          selected
+                            ? "bg-state-active text-foreground"
+                            : "text-foreground/90 hover:bg-state-hover",
+                        )}
+                      >
+                        <span className="w-6 shrink-0 text-center text-base leading-none">
+                          {spec.icon}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm">
+                            {spec.title}
+                          </span>
+                          <span className="block truncate text-[11px] text-muted-foreground tabular-nums">
+                            {group.label} · v{spec.revision} ·{" "}
+                            {relativeTime(spec.updatedAt)}
+                          </span>
+                        </span>
+                        {spec.openAnnotations > 0 ? (
+                          <span className="shrink-0 rounded-full bg-primary/15 px-1.5 text-[10px] text-primary tabular-nums">
+                            {spec.openAnnotations}
+                          </span>
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+            ))}
+          </div>
         )}
       </div>
     </div>
