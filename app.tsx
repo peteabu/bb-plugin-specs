@@ -960,6 +960,18 @@ function CommentCard({
             <Markdown content={annotation.body} />
           </div>
 
+          {isQuestion &&
+          !closed &&
+          annotation.answer === "" &&
+          annotation.dispatchedAt !== null &&
+          !annotation.comments.some((comment) => comment.author === "agent") ? (
+            <p className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+              <Icon name="Loading" className="size-3 animate-spin" />
+              Agent notified {relativeTime(annotation.dispatchedAt)} — it replies
+              in this thread
+            </p>
+          ) : null}
+
           {isQuestion && annotation.answer !== "" ? (
             <div className="mt-2 rounded-lg bg-secondary/50 px-2.5 py-2">
               <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
@@ -1141,7 +1153,7 @@ function CommentCard({
             <Input
               value={reply}
               onChange={(event) => setReply(event.target.value)}
-              placeholder="Reply…"
+              placeholder={isQuestion ? "Reply to the agent…" : "Reply…"}
               className="h-7 text-xs"
               onKeyDown={(event) => {
                 if (event.key === "Enter") {
@@ -1729,7 +1741,11 @@ function SpecsPage({ subPath }: { subPath: string }) {
       const wasQuestion = annotationDraft.kind === "question";
       setAnnotationDraft(null);
       setRailAndNavigate("comments");
-      toast.success(wasQuestion ? "Question added" : "Comment added");
+      toast.success(
+        wasQuestion
+          ? "Question sent — the agent replies in this thread"
+          : "Comment added",
+      );
       refetchDetail(selectedSlug);
     } catch (cause) {
       toast.error(messageOf(cause));
@@ -2256,6 +2272,17 @@ function SpecsPage({ subPath }: { subPath: string }) {
           >
             <Icon name="MessageSquare" className="size-3.5" />
             Comment
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setAnnotationDraft({ ...selectionMenu, body: "", kind: "question" });
+              setSelectionMenu(null);
+            }}
+            className="specs-press flex cursor-pointer items-center gap-1.5 rounded-lg border border-input px-2.5 py-1.5 text-xs font-medium hover:bg-state-hover"
+          >
+            <Icon name="MessageQuestion" className="size-3.5" />
+            Question
           </button>
         </div>
       )}

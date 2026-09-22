@@ -74,6 +74,7 @@ const annotationSchema = z.object({
   foldedRevision: z.number().int().nullable(),
   resolvedBy: z.string(),
   resolvedAt: z.string().nullable(),
+  dispatchedAt: z.string().nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
   comments: z.array(commentSchema),
@@ -323,6 +324,7 @@ interface AnnotationRecord {
   folded_revision: number | null;
   resolved_by: string;
   resolved_at: string | null;
+  dispatched_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -511,6 +513,11 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Inject spec context into project threads",
       default: true,
     },
+    autoTriageQuestions: {
+      type: "boolean",
+      label: "Send new questions to the spec's agent thread",
+      default: true,
+    },
   });
   let config = await settings.get();
   settings.onChange((next) => {
@@ -610,6 +617,7 @@ export default async function plugin(bb: BbPluginApi) {
       created_at TEXT NOT NULL
     )`,
     `CREATE INDEX IF NOT EXISTS question_events_spec_idx ON question_events(spec_id)`,
+    `ALTER TABLE annotations ADD COLUMN dispatched_at TEXT`,
   ]);
 
   // ---- project name cache (sync digest needs names without async sdk calls) --
@@ -796,6 +804,7 @@ export default async function plugin(bb: BbPluginApi) {
       foldedRevision: row.folded_revision,
       resolvedBy: row.resolved_by,
       resolvedAt: row.resolved_at,
+      dispatchedAt: row.dispatched_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       comments: byAnnotation.get(row.id) ?? [],
@@ -1144,6 +1153,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function ensureChatThread(
     spec: SpecRecord,
+    firstPrompt?: string,
   ): Promise<{ threadId: string; created: boolean }> {
     const existing = db
       .prepare("SELECT thread_id FROM chat_threads WHERE spec_id = ?")
@@ -1168,11 +1178,13 @@ export default async function plugin(bb: BbPluginApi) {
     const thread = await bb.sdk.threads.spawn({
       projectId,
       environment,
-      prompt: [
-        `This is the discussion thread for spec "${spec.title}" (slug "${spec.slug}").`,
-        `Read it with specs_read("${spec.slug}") first.`,
-        "Then reply with a short summary of what it covers plus any open questions or open annotations, and wait for direction. Keep every reply focused on this spec.",
-      ].join(" "),
+      prompt:
+        firstPrompt ??
+        [
+          `This is the discussion thread for spec "${spec.title}" (slug "${spec.slug}").`,
+          `Read it with specs_read("${spec.slug}") first.`,
+          "Then reply with a short summary of what it covers plus any open questions or open annotations, and wait for direction. Keep every reply focused on this spec.",
+        ].join(" "),
       title: `Spec: ${truncate(spec.title, 80)}`,
       pluginMetadata: { specId: spec.id },
     });
@@ -1310,6 +1322,106 @@ export default async function plugin(bb: BbPluginApi) {
       annotationId: created.id,
       revision: updated?.revision ?? spec.revision + 1,
     };
+  }
+
+  // Dispatch a question (or a follow-up reply) into the spec's agent thread.
+  // The agent is instructed to answer in the question's own comment thread.
+  async function dispatchQuestionToAgent(
+    spec: SpecRecord,
+    annotation: AnnotationRecord,
+    trigger: "asked" | "reply",
+  ): Promise<boolean> {
+    if (!config.autoTriageQuestions) return false;
+    const question = annotationById(annotation.id);
+    if (question === undefined || question.kind !== "question") return false;
+    const commentRows = db
+      .prepare(
+        "SELECT * FROM annotation_comments WHERE annotation_id = ? ORDER BY created_at ASC",
+      )
+      .all(question.id) as CommentRecord[];
+    const message = [
+      `This thread is the discussion thread for spec "${spec.title}" (slug "${spec.slug}").`,
+      trigger === "asked"
+        ? `A question was just asked on the spec and is dispatched to you.`
+        : `The user replied in the question's thread on the spec.`,
+      `Question id: ${question.id}`,
+      `Quoted text: ${truncate(question.quote, 200)}`,
+      `Question: ${truncate(question.body, 600)}`,
+      ...(question.answer === ""
+        ? []
+        : [`Current answer: ${truncate(question.answer, 300)}`]),
+      ...(commentRows.length === 0
+        ? []
+        : [
+            "Thread so far:",
+            ...commentRows
+              .slice(-8)
+              .map(
+                (comment) =>
+                  `- ${comment.author}: ${truncate(comment.body, 200)}`,
+              ),
+          ]),
+      "",
+      `Reply IN the question's thread with specs_reply({ annotationId: "${question.id}", body }) so the user sees it where they asked.`,
+      "If the spec and project context settle it, record specs_answer as well; if it is underspecified, use specs_clarify with one sharp follow-up.",
+      "Do not edit the spec unless the question asks for it.",
+    ].join("\n");
+    try {
+      const chat = await ensureChatThread(spec, message);
+      if (!chat.created) {
+        await bb.sdk.threads.send({
+          threadId: chat.threadId,
+          mode: "auto",
+          input: [{ type: "text", text: message, mentions: [] }],
+        });
+      }
+      db.prepare("UPDATE annotations SET dispatched_at = ? WHERE id = ?").run(
+        nowIso(),
+        question.id,
+      );
+      publishChanged(spec.id, "question-dispatched");
+      return true;
+    } catch (error) {
+      bb.log.warn(`question dispatch failed: ${String(error)}`);
+      return false;
+    }
+  }
+
+  function maybeDispatchQuestion(
+    spec: SpecRecord,
+    annotation: AnnotationRecord,
+  ): void {
+    if (annotation.kind !== "question") return;
+    if (annotation.author === "agent") return;
+    void dispatchQuestionToAgent(spec, annotation, "asked");
+  }
+
+  function addComment(
+    annotationId: string,
+    body: string,
+    author: string,
+    options?: { dispatch?: boolean },
+  ): { id: string } {
+    const annotation = annotationById(annotationId);
+    if (annotation === undefined) {
+      throw new Error(`No annotation with id ${annotationId}.`);
+    }
+    const id = `cmt_${randomUUID().slice(0, 8)}`;
+    db.prepare(
+      "INSERT INTO annotation_comments (id, annotation_id, body, author, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).run(id, annotationId, body, author, nowIso());
+    publishChanged(annotation.spec_id, "comment");
+    if (
+      options?.dispatch !== false &&
+      annotation.kind === "question" &&
+      author !== "agent"
+    ) {
+      const spec = findSpecById(annotation.spec_id);
+      if (spec !== undefined) {
+        void dispatchQuestionToAgent(spec, annotation, "reply");
+      }
+    }
+    return { id };
   }
 
   // ---- context digest ------------------------------------------------------
@@ -1865,6 +1977,30 @@ export default async function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
+    name: "specs_reply",
+    description:
+      "Reply inside a question's (or note's) comment thread. Questions dispatched to you must be answered here, in the thread where the user asked.",
+    instructions:
+      "When a question is dispatched to you, reply with specs_reply on that annotation id, then record specs_answer or specs_clarify as appropriate.",
+    presentation: {
+      label: { pending: "Replying in thread", completed: "Replied in thread" },
+      icon: { glyph: "MessageSquare" },
+    },
+    parameters: z.object({
+      annotationId: z.string().min(1),
+      body: z.string().min(1).max(5000),
+    }),
+    execute: ({ annotationId, body }) => {
+      try {
+        const comment = addComment(annotationId, body, "agent");
+        return toolText(`Replied in ${annotationId} (${comment.id}).`);
+      } catch (error) {
+        return toolError(error instanceof Error ? error.message : String(error));
+      }
+    },
+  });
+
+  bb.agents.registerTool({
     name: "specs_questions",
     description:
       "List open questions across specs: open, answered but untriaged, in clarification, or closed. This is the loop's inbox — answer with specs_answer, ask for clarification with specs_clarify, decide with specs_resolve, or drop with specs_dismiss.",
@@ -2136,6 +2272,7 @@ export default async function plugin(bb: BbPluginApi) {
     "specs_write",
     "specs_create",
     "specs_annotate",
+    "specs_reply",
     "specs_questions",
     "specs_answer",
     "specs_clarify",
@@ -2333,6 +2470,7 @@ export default async function plugin(bb: BbPluginApi) {
         author: "user",
         kind: kind ?? "note",
       });
+      maybeDispatchQuestion(spec, created);
       return { id: created.id };
     },
 
@@ -2362,18 +2500,17 @@ export default async function plugin(bb: BbPluginApi) {
     },
 
     questions_promote: ({ specId, text }) => {
-      return promoteTextQuestion(specId, text, "user");
+      const result = promoteTextQuestion(specId, text, "user");
+      const spec = findSpecById(specId);
+      const created = annotationById(result.annotationId);
+      if (spec !== undefined && created !== undefined) {
+        maybeDispatchQuestion(spec, created);
+      }
+      return result;
     },
 
     annotations_comment: ({ annotationId, body }) => {
-      if (annotationById(annotationId) === undefined) {
-        throw new Error(`No annotation with id ${annotationId}.`);
-      }
-      const id = `cmt_${randomUUID().slice(0, 8)}`;
-      db.prepare(
-        "INSERT INTO annotation_comments (id, annotation_id, body, author, created_at) VALUES (?, ?, ?, 'user', ?)",
-      ).run(id, annotationId, body, nowIso());
-      return { id };
+      return addComment(annotationId, body, "user");
     },
 
     annotations_set_status: ({ annotationId, status }) => {
@@ -2559,6 +2696,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb specs unlink <id-or-slug> --project <id> [--json]",
     "  bb specs annotate <id-or-slug> --quote <text> --body <text> [--kind note|question] [--json]",
     "  bb specs questions [<id-or-slug>] [--state open|answered|clarify|resolved|dismissed|all] [--project <id>] [--json]",
+    "  bb specs reply <annotation-id> <reply text> [--json]",
     "  bb specs promote <id-or-slug> <question text as written> [--json]",
     "  bb specs answer <annotation-id> --text <answer> [--json]",
     "  bb specs clarify <annotation-id> <follow-up question> [--json]",
@@ -2591,6 +2729,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "unlink", summary: "Unlink a spec from a project", usage: "bb specs unlink <id-or-slug> --project <id> [--json]" },
       { name: "annotate", summary: "Annotate a spec with a note or question", usage: "bb specs annotate <id-or-slug> --quote <text> --body <text> [--kind note|question] [--json]" },
       { name: "questions", summary: "List questions and their loop state", usage: "bb specs questions [<id-or-slug>] [--state <state>] [--project <id>] [--json]" },
+      { name: "reply", summary: "Reply inside a question's thread", usage: "bb specs reply <annotation-id> <reply text> [--json]" },
       { name: "promote", summary: "Promote a question written in the spec text", usage: "bb specs promote <id-or-slug> <question text as written> [--json]" },
       { name: "answer", summary: "Answer a question for triage", usage: "bb specs answer <annotation-id> --text <answer> [--json]" },
       { name: "clarify", summary: "Ask a follow-up question", usage: "bb specs clarify <annotation-id> <follow-up question> [--json]" },
@@ -2790,16 +2929,33 @@ export default async function plugin(bb: BbPluginApi) {
             }
             const spec = mustFindSpec(idOrSlug);
             const kind = flagString("kind") === "question" ? "question" : "note";
+            // A CLI run inside a thread is agent work, not a user asking.
+            const actor = ctx.threadId === undefined ? "cli" : "agent";
             const created = createAnnotation({
               specId: spec.id,
               quote,
               body,
-              author: "cli",
+              author: actor,
               kind,
             });
+            if (actor === "cli") maybeDispatchQuestion(spec, created);
             return reply(
               { ok: true, id: created.id, kind: created.kind },
               `Added ${created.kind} ${created.id}.`,
+            );
+          }
+
+          case "reply": {
+            const annotationId = rest[0];
+            const body = rest.slice(1).join(" ").trim();
+            if (annotationId === undefined || body === "") return fail(usage);
+            const actor = ctx.threadId === undefined ? "cli" : "agent";
+            const comment = addComment(annotationId, body, actor, {
+              dispatch: actor === "cli",
+            });
+            return reply(
+              { ok: true, id: comment.id },
+              `Replied in ${annotationId} (${comment.id}).`,
             );
           }
 
@@ -2863,7 +3019,11 @@ export default async function plugin(bb: BbPluginApi) {
             const annotationId = rest[0];
             const answer = flagString("text") ?? rest.slice(1).join(" ").trim();
             if (annotationId === undefined || answer === "") return fail(usage);
-            answerQuestion(annotationId, answer, "cli");
+            answerQuestion(
+              annotationId,
+              answer,
+              ctx.threadId === undefined ? "cli" : "agent",
+            );
             return reply(
               { ok: true, annotationId },
               `Answered ${annotationId}; it is awaiting triage.`,
@@ -2874,7 +3034,11 @@ export default async function plugin(bb: BbPluginApi) {
             const annotationId = rest[0];
             const question = rest.slice(1).join(" ").trim();
             if (annotationId === undefined || question === "") return fail(usage);
-            const child = clarifyQuestion(annotationId, question, "cli");
+            const child = clarifyQuestion(
+              annotationId,
+              question,
+              ctx.threadId === undefined ? "cli" : "agent",
+            );
             return reply(
               { ok: true, childId: child.id },
               `Created follow-up ${child.id} for ${annotationId}.`,
@@ -2892,7 +3056,7 @@ export default async function plugin(bb: BbPluginApi) {
             resolveQuestion(
               annotationId,
               decision,
-              "cli",
+              ctx.threadId === undefined ? "cli" : "agent",
               foldedRevision === undefined || Number.isNaN(foldedRevision)
                 ? undefined
                 : foldedRevision,
@@ -2903,7 +3067,11 @@ export default async function plugin(bb: BbPluginApi) {
           case "dismiss": {
             const annotationId = rest[0];
             if (annotationId === undefined) return fail(usage);
-            dismissQuestion(annotationId, flagString("reason") ?? "", "cli");
+            dismissQuestion(
+              annotationId,
+              flagString("reason") ?? "",
+              ctx.threadId === undefined ? "cli" : "agent",
+            );
             return reply({ ok: true, annotationId }, `Dismissed ${annotationId}.`);
           }
 

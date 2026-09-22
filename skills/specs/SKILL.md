@@ -26,6 +26,7 @@ in the injected context; full content is pulled on demand.
 | `specs_write` | Update content/title/summary. Pass `expectedRevision` from the read; a conflict means re-read and merge. |
 | `specs_create` | Create a spec, link it to a project, attach it to this thread. |
 | `specs_annotate` | Leave a quoted note, or `kind: "question"` to open one that enters the question loop. |
+| `specs_reply` | Reply inside a question's or note's comment thread. |
 | `specs_questions` | The loop's inbox: list questions by state across a spec or project. |
 | `specs_answer` | Answer an open question; it moves to answered and waits for triage. |
 | `specs_clarify` | Ask a follow-up when an answer is not enough to decide. |
@@ -45,7 +46,18 @@ instead of answering once and moving on:
 
 1. **Fetch** with `specs_questions` (or `bb specs questions`). States sort as
    `answered` (triage inbox) → `open` → `clarify` → closed.
-2. **Answer** with `specs_answer` when the spec and project context settle it.
+2. **Questions asked by the user are dispatched to you.** When the user asks in
+   the UI or from a standalone CLI, the plugin sends the question to the spec's
+   agent thread; a user reply in the thread dispatches another turn. When that
+   happens:
+   - **Reply in the question's own thread** with
+     `specs_reply({ annotationId, body })` — that is where the user is reading.
+   - Then record `specs_answer` if the spec and project context settle it, or
+     `specs_clarify` with one sharp follow-up if not.
+   - Never edit the spec unless the question asks for it. CLI runs inside a
+     thread do not re-dispatch, so replies made with `bb specs reply` cannot
+     loop.
+3. **Answer** with `specs_answer` when the spec and project context settle it.
    The question moves to `answered` and waits for triage.
 3. **Triage the answer**: is it enough to decide?
    - No → `specs_clarify` with one sharp follow-up. The parent moves to
