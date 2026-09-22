@@ -312,3 +312,47 @@ mark.specs-annotation-mark {
 .specs-popover {
   max-width: calc(100vw - 24px);
 }
+
+/* --- rich markdown editor (Lexical) --------------------------------------- */
+
+.specs-rich-editor {
+  position: relative;
+}
+
+.specs-rich-surface {
+  min-height: 50vh;
+  outline: none;
+}
+
+.specs-rich-surface:focus {
+  outline: none;
+}
+
+.specs-rich-placeholder {
+  position: absolute;
+  top: 0;
+  left: 0;
+  pointer-events: none;
+  color: color-mix(in oklab, var(--muted-foreground) 60%, transparent);
+  font-size: 1rem;
+  line-height: 1.75;
+}
+
+.specs-code-block {
+  display: block;
+  white-space: pre-wrap;
+  background-color: var(--secondary);
+  border-radius: 0.75rem;
+  padding: 1rem 1.125rem;
+  margin: 1.25rem 0;
+  font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+  font-size: 0.875rem;
+  line-height: 1.6;
+}
+
+.specs-quote-block {
+  border-left: 3px solid color-mix(in oklab, var(--primary) 45%, transparent);
+  padding-left: 1rem;
+  margin: 1.25rem 0;
+  color: var(--muted-foreground);
+}

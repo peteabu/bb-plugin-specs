@@ -46,6 +46,10 @@ import {
 } from "@/components/ui/dialog";
 import { Icon } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
+import {
+  MarkdownEditor,
+  focusSpecEditor,
+} from "@/components/ui/markdown-editor";
 import { cn } from "@/lib/utils";
 import "./app.css";
 
@@ -389,10 +393,12 @@ function SpecsSidebar({
   onSelect,
   onNewDefault,
   onNewInGroup,
+  compact,
 }: {
   specs: SpecSummary[] | null;
   projects: ProjectSummary[];
   selectedSlug: string;
+  compact?: boolean;
   query: string;
   onQuery: (value: string) => void;
   onSelect: (slug: string) => void;
@@ -438,7 +444,12 @@ function SpecsSidebar({
   );
 
   return (
-    <aside className="hidden w-[264px] shrink-0 flex-col border-r border-border md:flex">
+    <aside
+      className={cn(
+        "hidden shrink-0 flex-col border-r border-border md:flex",
+        compact === true ? "w-[200px]" : "w-[264px]",
+      )}
+    >
       <div className="space-y-2 px-3 pb-2 pt-3">
         <div className="flex items-center justify-between px-1">
           <span className="text-sm font-semibold tracking-tight">Specs</span>
@@ -539,7 +550,9 @@ function SpecsSidebar({
                           >
                             {spec.openAnnotations > 0
                               ? `${spec.openAnnotations} 💬`
-                              : relativeTime(spec.updatedAt)}
+                              : compact === true
+                                ? ""
+                                : relativeTime(spec.updatedAt)}
                           </span>
                         </button>
                       );
@@ -550,11 +563,13 @@ function SpecsSidebar({
         )}
       </div>
 
-      <div className="border-t border-border px-4 py-2 text-[10px] text-muted-foreground tabular-nums">
-        {specs === null
-          ? ""
-          : `${specs.length} spec${specs.length === 1 ? "" : "s"} · ${openComments} open comment${openComments === 1 ? "" : "s"}`}
-      </div>
+      {compact === true ? null : (
+        <div className="border-t border-border px-4 py-2 text-[10px] text-muted-foreground tabular-nums">
+          {specs === null
+            ? ""
+            : `${specs.length} spec${specs.length === 1 ? "" : "s"} · ${openComments} open comment${openComments === 1 ? "" : "s"}`}
+        </div>
+      )}
     </aside>
   );
 }
@@ -1694,6 +1709,7 @@ function SpecsWorkspace({
   selectedSlug,
   tabPart,
   showSidebar,
+  compactSidebar,
   chrome,
   onSelectSpec,
   onSelectTab,
@@ -1702,6 +1718,7 @@ function SpecsWorkspace({
   selectedSlug: string;
   tabPart: string;
   showSidebar: boolean;
+  compactSidebar?: boolean;
   chrome: "route" | "panel" | "overlay";
   onSelectSpec: (slug: string) => void;
   onSelectTab: (tab: "document" | "annotations" | "chat") => void;
@@ -1749,7 +1766,6 @@ function SpecsWorkspace({
   const pendingCreateRef = useRef<string | null>(null);
   const focusTitleRef = useRef(false);
   const titleInputRef = useRef<HTMLInputElement | null>(null);
-  const contentInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const refetchList = useCallback(() => {
     rpc.call("specs_list", {}).then(
@@ -2332,6 +2348,7 @@ function SpecsWorkspace({
           onSelect={selectSpec}
           onNewDefault={() => void createSpec(defaultProjectId)}
           onNewInGroup={(projectId) => void createSpec(projectId)}
+          compact={compactSidebar === true}
         />
       ) : null}
 
@@ -2558,7 +2575,7 @@ function SpecsWorkspace({
                       }
                       if (event.key === "Enter" && !event.shiftKey) {
                         event.preventDefault();
-                        contentInputRef.current?.focus();
+                        focusSpecEditor();
                       }
                       if (event.key === "Escape") cancelEdit();
                     }}
@@ -2688,19 +2705,12 @@ function SpecsWorkspace({
 
                 <div className="mt-6 border-t border-border pt-6">
                   {editing ? (
-                    <textarea
-                      ref={contentInputRef}
+                    <MarkdownEditor
+                      key={detail.spec.id}
                       value={contentDraft}
-                      onChange={(event) => setContentDraft(event.target.value)}
-                      onKeyDown={(event) => {
-                        if ((event.metaKey || event.ctrlKey) && event.key === "s") {
-                          event.preventDefault();
-                          void save();
-                        }
-                        if (event.key === "Escape") cancelEdit();
-                      }}
-                      placeholder="# Overview&#10;&#10;Write the spec in markdown. Select text in the reading view to comment on it."
-                      className="specs-editor min-h-[50vh] w-full"
+                      onChange={setContentDraft}
+                      onSave={() => void save()}
+                      onEscape={cancelEdit}
                     />
                   ) : detail.spec.content.trim() === "" ? (
                     <div className="rounded-xl border border-dashed border-border px-6 py-10 text-center">
@@ -3306,7 +3316,8 @@ function SpecsPanelTab({ params }: { params: unknown }) {
     <SpecsWorkspace
       selectedSlug={slug}
       tabPart={tab}
-      showSidebar={false}
+      showSidebar
+      compactSidebar
       chrome="panel"
       onSelectSpec={(next) => {
         setSlug(next);
