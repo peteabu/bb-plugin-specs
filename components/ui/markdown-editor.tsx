@@ -1,13 +1,13 @@
 // A rich-text editor that still stores markdown.
 //
-// Specs are markdown, but people shouldn't have to type markdown syntax to
-// write a document. This wraps Lexical (Meta's editor engine) with the markdown
-// transformers: headings, lists, quotes, and code render as you type, markdown
-// shortcuts (##, **, -, >) still work, and the value handed back to the plugin
-// is serialized markdown — so revisions, diffs, agents, and the digest are
-// unchanged.
-import { useCallback, useRef } from "react";
-import type { ReactNode } from "react";
+// Specs are markdown, but people shouldn't have to type markdown syntax. The
+// experience is Notion-like: block types come from a slash menu at the caret,
+// inline formatting from a floating bar on selection, and markdown shortcuts
+// (#, -, >, ```) keep working for people who like them. The value handed back
+// to the plugin is serialized markdown, so revisions, diffs, agents, and the
+// digest are unchanged.
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { LexicalComposer } from "@lexical/react/LexicalComposer";
 import { useLexicalComposerContext } from "@lexical/react/LexicalComposerContext";
 import { RichTextPlugin } from "@lexical/react/LexicalRichTextPlugin";
@@ -18,6 +18,11 @@ import { LinkPlugin } from "@lexical/react/LexicalLinkPlugin";
 import { MarkdownShortcutPlugin } from "@lexical/react/LexicalMarkdownShortcutPlugin";
 import { OnChangePlugin } from "@lexical/react/LexicalOnChangePlugin";
 import { LexicalErrorBoundary } from "@lexical/react/LexicalErrorBoundary";
+import {
+  LexicalTypeaheadMenuPlugin,
+  MenuOption,
+  useBasicTypeaheadTriggerMatch,
+} from "@lexical/react/LexicalTypeaheadMenuPlugin";
 import {
   $createHeadingNode,
   $createQuoteNode,
@@ -31,9 +36,10 @@ import {
   ListNode,
 } from "@lexical/list";
 import {
-  $createCodeNode,
-  CodeNode,
-} from "@lexical/code";
+  INSERT_HORIZONTAL_RULE_COMMAND,
+  HorizontalRuleNode,
+} from "@lexical/react/LexicalHorizontalRuleNode";
+import { $createCodeNode, CodeNode } from "@lexical/code";
 import { LinkNode, TOGGLE_LINK_COMMAND } from "@lexical/link";
 import {
   $convertFromMarkdownString,
@@ -48,6 +54,7 @@ import {
   type ElementNode,
   type LexicalEditor,
   type EditorState,
+  type TextNode,
 } from "lexical";
 import { $setBlocksType } from "@lexical/selection";
 import { cn } from "../../lib/utils";
@@ -66,103 +73,199 @@ function setBlock(editor: LexicalEditor, create: () => ElementNode): void {
   });
 }
 
-interface Tool {
-  id: string;
-  label: string;
-  title: string;
-  run: (editor: LexicalEditor) => void;
+type BlockKind = "text" | "heading" | "bullet" | "ordered" | "quote" | "code" | "divider";
+
+class SlashOption extends MenuOption {
+  constructor(
+    readonly title: string,
+    readonly glyph: string,
+    readonly keywords: string[],
+    readonly kind: BlockKind,
+  ) {
+    super(title);
+  }
 }
 
-const TOOLS: Tool[] = [
-  {
-    id: "paragraph",
-    label: "¶",
-    title: "Paragraph",
-    run: (editor) => setBlock(editor, () => $createParagraphNode()),
-  },
-  {
-    id: "heading",
-    label: "H",
-    title: "Heading",
-    run: (editor) => setBlock(editor, () => $createHeadingNode("h2")),
-  },
-  {
-    id: "bold",
-    label: "B",
-    title: "Bold (⌘B)",
-    run: (editor) => {
-      editor.dispatchCommand(FORMAT_TEXT_COMMAND, "bold");
-    },
-  },
-  {
-    id: "italic",
-    label: "I",
-    title: "Italic (⌘I)",
-    run: (editor) => {
-      editor.dispatchCommand(FORMAT_TEXT_COMMAND, "italic");
-    },
-  },
-  {
-    id: "bullet",
-    label: "•",
-    title: "Bulleted list",
-    run: (editor) => {
-      editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined);
-    },
-  },
-  {
-    id: "ordered",
-    label: "1.",
-    title: "Numbered list",
-    run: (editor) => {
-      editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined);
-    },
-  },
-  {
-    id: "quote",
-    label: "❝",
-    title: "Quote",
-    run: (editor) => setBlock(editor, () => $createQuoteNode()),
-  },
-  {
-    id: "code",
-    label: "</>",
-    title: "Code block",
-    run: (editor) => setBlock(editor, () => $createCodeNode()),
-  },
-  {
-    id: "link",
-    label: "Link",
-    title: "Link",
-    run: (editor) => {
-      const url = window.prompt("Link URL");
-      if (url !== null && url.trim() !== "") {
-        editor.dispatchCommand(TOGGLE_LINK_COMMAND, url.trim());
-      }
-    },
-  },
+const SLASH_OPTIONS: SlashOption[] = [
+  new SlashOption("Text", "¶", ["paragraph", "body", "plain"], "text"),
+  new SlashOption("Heading", "H", ["title", "h2"], "heading"),
+  new SlashOption("Bulleted list", "•", ["bullet", "unordered", "ul"], "bullet"),
+  new SlashOption("Numbered list", "1.", ["ordered", "number", "ol"], "ordered"),
+  new SlashOption("Quote", "❝", ["blockquote"], "quote"),
+  new SlashOption("Code block", "</>", ["code", "pre"], "code"),
+  new SlashOption("Divider", "—", ["horizontal", "rule", "hr"], "divider"),
 ];
 
-function Toolbar() {
+function runBlock(editor: LexicalEditor, kind: BlockKind): void {
+  switch (kind) {
+    case "text":
+      setBlock(editor, () => $createParagraphNode());
+      return;
+    case "heading":
+      setBlock(editor, () => $createHeadingNode("h2"));
+      return;
+    case "bullet":
+      editor.dispatchCommand(INSERT_UNORDERED_LIST_COMMAND, undefined);
+      return;
+    case "ordered":
+      editor.dispatchCommand(INSERT_ORDERED_LIST_COMMAND, undefined);
+      return;
+    case "quote":
+      setBlock(editor, () => $createQuoteNode());
+      return;
+    case "code":
+      setBlock(editor, () => $createCodeNode());
+      return;
+    case "divider":
+      editor.dispatchCommand(INSERT_HORIZONTAL_RULE_COMMAND, undefined);
+      return;
+  }
+}
+
+function SlashMenu() {
   const [editor] = useLexicalComposerContext();
+  const [query, setQuery] = useState<string | null>(null);
+  const triggerFn = useBasicTypeaheadTriggerMatch("/", { minLength: 0 });
+  const options = useMemo(() => {
+    if (query === null) return [];
+    const needle = query.toLowerCase();
+    return SLASH_OPTIONS.filter((option) =>
+      `${option.title} ${option.keywords.join(" ")}`.toLowerCase().includes(needle),
+    );
+  }, [query]);
+
   return (
-    <div className="mb-2 flex flex-wrap items-center gap-0.5 border-b border-border pb-2">
-      {TOOLS.map((tool) => (
-        <button
-          key={tool.id}
-          type="button"
-          title={tool.title}
-          aria-label={tool.title}
-          onMouseDown={(event) => event.preventDefault()}
-          onClick={() => tool.run(editor)}
-          className="specs-press grid h-7 min-w-7 cursor-pointer place-items-center rounded-md px-1.5 text-xs font-medium text-muted-foreground hover:bg-state-hover hover:text-foreground"
-        >
-          {tool.label}
-        </button>
-      ))}
-      <span className="ml-auto hidden text-[10px] text-muted-foreground sm:block">
-        Markdown shortcuts work too (##, **, -, &gt;)
-      </span>
+    <LexicalTypeaheadMenuPlugin<SlashOption>
+      onQueryChange={setQuery}
+      onSelectOption={(
+        option: SlashOption,
+        nodeToRemove: TextNode | null,
+        closeMenu: () => void,
+      ) => {
+        editor.update(() => {
+          nodeToRemove?.remove();
+        });
+        runBlock(editor, option.kind);
+        closeMenu();
+      }}
+      triggerFn={triggerFn}
+      options={options}
+      menuRenderFn={(anchorRef, { selectedIndex, selectOptionAndCleanUp, setHighlightedIndex }) =>
+        anchorRef.current !== null && options.length > 0
+          ? createPortal(
+              <div className="specs-slash-menu" role="listbox">
+                {options.map((option, index) => (
+                  <button
+                    key={option.key}
+                    type="button"
+                    role="option"
+                    aria-selected={index === selectedIndex}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onMouseEnter={() => setHighlightedIndex(index)}
+                    onClick={() => selectOptionAndCleanUp(option)}
+                    className={cn(
+                      "specs-slash-item",
+                      index === selectedIndex && "specs-slash-item-active",
+                    )}
+                  >
+                    <span className="specs-slash-icon">{option.glyph}</span>
+                    {option.title}
+                  </button>
+                ))}
+              </div>,
+              anchorRef.current,
+            )
+          : null
+      }
+    />
+  );
+}
+
+/** Floating inline-format bar over a text selection, like Notion's. */
+function SelectionBar() {
+  const [editor] = useLexicalComposerContext();
+  const [position, setPosition] = useState<{ top: number; left: number } | null>(
+    null,
+  );
+
+  useEffect(() => {
+    const update = () => {
+      const selection = window.getSelection();
+      const root = editor.getRootElement();
+      if (
+        selection === null ||
+        selection.isCollapsed ||
+        selection.rangeCount === 0 ||
+        root === null
+      ) {
+        setPosition(null);
+        return;
+      }
+      const range = selection.getRangeAt(0);
+      if (!root.contains(range.commonAncestorContainer)) {
+        setPosition(null);
+        return;
+      }
+      const rect = range.getBoundingClientRect();
+      if (rect.width === 0 && rect.height === 0) {
+        setPosition(null);
+        return;
+      }
+      const above = rect.top - 44;
+      setPosition({
+        top: above < 8 ? rect.bottom + 10 : above,
+        left: rect.left + rect.width / 2,
+      });
+    };
+    document.addEventListener("selectionchange", update);
+    return () => document.removeEventListener("selectionchange", update);
+  }, [editor]);
+
+  if (position === null) return null;
+  return (
+    <div
+      className="specs-toolbar"
+      style={{ top: position.top, left: position.left }}
+      onMouseDown={(event) => event.preventDefault()}
+    >
+      <button
+        type="button"
+        title="Bold (⌘B)"
+        onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, "bold")}
+        className="specs-toolbar-button font-semibold"
+      >
+        B
+      </button>
+      <button
+        type="button"
+        title="Italic (⌘I)"
+        onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, "italic")}
+        className="specs-toolbar-button italic"
+      >
+        I
+      </button>
+      <button
+        type="button"
+        title="Inline code"
+        onClick={() => editor.dispatchCommand(FORMAT_TEXT_COMMAND, "code")}
+        className="specs-toolbar-button font-mono text-[11px]"
+      >
+        {"</>"}
+      </button>
+      <span className="mx-0.5 h-4 w-px bg-border" />
+      <button
+        type="button"
+        title="Link"
+        onClick={() => {
+          const url = window.prompt("Link URL");
+          if (url !== null && url.trim() !== "") {
+            editor.dispatchCommand(TOGGLE_LINK_COMMAND, url.trim());
+          }
+        }}
+        className="specs-toolbar-button"
+      >
+        Link
+      </button>
     </div>
   );
 }
@@ -209,7 +312,15 @@ export function MarkdownEditor({
       initialConfig={{
         namespace: "specs-markdown",
         theme: EDITOR_THEME,
-        nodes: [HeadingNode, QuoteNode, ListNode, ListItemNode, LinkNode, CodeNode],
+        nodes: [
+          HeadingNode,
+          QuoteNode,
+          ListNode,
+          ListItemNode,
+          LinkNode,
+          CodeNode,
+          HorizontalRuleNode,
+        ],
         editorState: () => {
           $convertFromMarkdownString(value, TRANSFORMERS);
         },
@@ -229,7 +340,6 @@ export function MarkdownEditor({
           if (event.key === "Escape") onEscape?.();
         }}
       >
-        <Toolbar />
         <div className="relative">
           <RichTextPlugin
             contentEditable={
@@ -240,16 +350,18 @@ export function MarkdownEditor({
             }
             placeholder={
               <p className="specs-rich-placeholder">
-                Write normally — use the buttons above, or markdown shortcuts.
+                Write, or type / for headings, lists, and more…
               </p>
             }
             ErrorBoundary={LexicalErrorBoundary}
           />
+          <SelectionBar />
         </div>
         <HistoryPlugin />
         <ListPlugin />
         <LinkPlugin />
         <MarkdownShortcutPlugin transformers={TRANSFORMERS} />
+        <SlashMenu />
         <MarkdownChanges onChange={onChange} initialMarkdown={value} />
       </div>
     </LexicalComposer>

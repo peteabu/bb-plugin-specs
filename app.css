@@ -356,3 +356,70 @@ mark.specs-annotation-mark {
   margin: 1.25rem 0;
   color: var(--muted-foreground);
 }
+
+/* --- slash menu and selection bar ----------------------------------------- */
+
+.specs-slash-menu {
+  position: absolute;
+  z-index: 80;
+  min-width: 240px;
+  max-height: 300px;
+  overflow-y: auto;
+  border-radius: 0.75rem;
+  background-color: var(--popover, var(--card));
+  box-shadow: var(--specs-pop);
+  padding: 0.25rem;
+  animation: specs-menu-in 140ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.specs-slash-item {
+  display: flex;
+  width: 100%;
+  cursor: pointer;
+  align-items: center;
+  gap: 0.625rem;
+  border-radius: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+  font-size: 0.875rem;
+  color: var(--foreground);
+}
+
+.specs-slash-item-active,
+.specs-slash-item:hover {
+  background-color: var(--state-hover, var(--secondary));
+}
+
+.specs-slash-icon {
+  display: grid;
+  width: 1.75rem;
+  height: 1.75rem;
+  place-items: center;
+  border-radius: 0.375rem;
+  background-color: var(--secondary);
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.specs-toolbar-button {
+  display: grid;
+  min-width: 1.75rem;
+  height: 1.75rem;
+  cursor: pointer;
+  place-items: center;
+  border-radius: 0.5rem;
+  padding: 0 0.375rem;
+  font-size: 0.75rem;
+  color: var(--muted-foreground);
+}
+
+.specs-toolbar-button:hover {
+  background-color: var(--state-hover, var(--secondary));
+  color: var(--foreground);
+}
+
+.specs-rich-surface hr {
+  border-color: var(--border);
+  margin: 2rem 0;
+}
