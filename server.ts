@@ -67,6 +67,8 @@ const annotationSchema = z.object({
   kind: z.enum(["note", "question"]),
   state: z.enum(["open", "answered", "clarify", "resolved", "dismissed"]),
   answer: z.string(),
+  requiresSpecChange: z.boolean(),
+  changeRequested: z.boolean(),
   answeredBy: z.string(),
   answeredAt: z.string().nullable(),
   parentId: z.string().nullable(),
@@ -293,8 +295,17 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       annotationId: z.string(),
       answer: z.string().trim().min(1).max(5000),
+      requiresSpecChange: z.boolean().optional(),
     }),
     output: z.object({ ok: z.literal(true) }),
+  },
+  questions_accept: {
+    input: z.object({ annotationId: z.string(), expectedAnswer: z.string(), expectedUpdatedAt: z.string() }),
+    output: z.object({ status: z.enum(["resolved", "preparing"]) }),
+  },
+  questions_apply: {
+    input: z.object({ annotationId: z.string(), proposalId: z.string(), expectedAnswer: z.string(), expectedUpdatedAt: z.string() }),
+    output: z.object({ revision: z.number().int() }),
   },
   questions_clarify: {
     input: z.object({
@@ -518,6 +529,8 @@ interface AnnotationRecord {
   kind: "note" | "question";
   state: "open" | "answered" | "clarify" | "resolved" | "dismissed";
   answer: string;
+  requires_spec_change: number;
+  change_requested: number;
   answered_by: string;
   answered_at: string | null;
   parent_id: string | null;
@@ -880,6 +893,8 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE specs ADD COLUMN acked_revision INTEGER`,
     `ALTER TABLE specs ADD COLUMN parent_spec_id TEXT`,
     `ALTER TABLE proposals ADD COLUMN icon TEXT`,
+    `ALTER TABLE annotations ADD COLUMN requires_spec_change INTEGER NOT NULL DEFAULT 1`,
+    `ALTER TABLE annotations ADD COLUMN change_requested INTEGER NOT NULL DEFAULT 0`,
   ]);
 
   // ---- project name cache (sync digest needs names without async sdk calls) --
@@ -1059,6 +1074,8 @@ export default async function plugin(bb: BbPluginApi) {
       kind: row.kind,
       state: row.state,
       answer: row.answer,
+      requiresSpecChange: row.requires_spec_change === 1,
+      changeRequested: row.change_requested === 1,
       answeredBy: row.answered_by,
       answeredAt: row.answered_at,
       parentId: row.parent_id,
@@ -1152,12 +1169,17 @@ export default async function plugin(bb: BbPluginApi) {
     annotationId: string,
     answer: string,
     actor: string,
+    requiresSpecChange = true,
   ): AnnotationRecord {
     const question = mustFindQuestion(annotationId);
-    const timestamp = nowIso();
+    if (question.status === "resolved") throw new Error("This question is closed. Reopen it before answering.");
+    const timestamp = new Date(Math.max(Date.now(), Date.parse(question.updated_at) + 1)).toISOString();
+    if (question.answer !== "" && question.answer !== answer) {
+      db.prepare("UPDATE proposals SET status = 'superseded', resolved_at = ?, resolution_note = 'Answer changed; awaiting an updated proposal' WHERE question_id = ? AND status = 'pending'").run(timestamp, annotationId);
+    }
     db.prepare(
-      `UPDATE annotations SET answer = ?, answered_by = ?, answered_at = ?, state = 'answered', status = 'open', updated_at = ? WHERE id = ?`,
-    ).run(answer, actor, timestamp, timestamp, annotationId);
+      `UPDATE annotations SET answer = ?, requires_spec_change = ?, change_requested = 0, answered_by = ?, answered_at = ?, state = 'answered', status = 'open', updated_at = ? WHERE id = ?`,
+    ).run(answer, requiresSpecChange ? 1 : 0, actor, timestamp, timestamp, annotationId);
     recordQuestionEvent(annotationId, question.spec_id, "answered", actor, answer);
     publishChanged(question.spec_id, "question-answered");
     return mustFindQuestion(annotationId);
@@ -1225,6 +1247,51 @@ export default async function plugin(bb: BbPluginApi) {
     });
     publishChanged(question.spec_id, "question-resolved");
     return mustFindQuestion(annotationId);
+  }
+
+  function answerForAcceptance(annotationId: string, expectedAnswer: string, expectedUpdatedAt: string): AnnotationRecord {
+    const question = mustFindQuestion(annotationId);
+    if (question.status !== "open" || question.state !== "answered" || question.answer.trim() === "") {
+      throw new Error("Wait for an answer before accepting this decision.");
+    }
+    if (question.answer !== expectedAnswer || question.updated_at !== expectedUpdatedAt) {
+      throw new Error("This answer changed. Review the latest answer before accepting.");
+    }
+    return question;
+  }
+
+  async function acceptQuestion(annotationId: string, expectedAnswer: string, expectedUpdatedAt: string) {
+    const question = answerForAcceptance(annotationId, expectedAnswer, expectedUpdatedAt);
+    const pending = db.prepare("SELECT id FROM proposals WHERE question_id = ? AND status = 'pending'").get(annotationId);
+    if (pending !== undefined) throw new Error("Review the proposed change before accepting this decision.");
+    if (!question.requires_spec_change) {
+      db.transaction(() => resolveQuestion(annotationId, question.answer, "user"))();
+      return { status: "resolved" as const };
+    }
+    if (question.change_requested) return { status: "preparing" as const };
+    db.prepare("UPDATE annotations SET change_requested = 1 WHERE id = ?").run(annotationId);
+    const spec = mustFindSpec(question.spec_id);
+    const dispatched = await dispatchQuestionToAgent(spec, question, "accepted");
+    if (!dispatched) {
+      db.prepare("UPDATE annotations SET change_requested = 0 WHERE id = ?").run(annotationId);
+      publishChanged(spec.id, "proposal-request-failed");
+      throw new Error("Could not ask the agent to prepare the change. Try accepting again.");
+    }
+    publishChanged(spec.id, "proposal-requested");
+    return { status: "preparing" as const };
+  }
+
+  function applyQuestionProposal(annotationId: string, proposalId: string, expectedAnswer: string, expectedUpdatedAt: string) {
+    return db.transaction(() => {
+      const question = answerForAcceptance(annotationId, expectedAnswer, expectedUpdatedAt);
+      const proposal = db.prepare("SELECT * FROM proposals WHERE id = ?").get(proposalId) as ProposalRecord | undefined;
+      if (proposal === undefined || proposal.question_id !== question.id || proposal.spec_id !== question.spec_id) {
+        throw new Error("This proposal does not belong to this question.");
+      }
+      const result = applyProposal(proposalId, "user");
+      resolveQuestion(annotationId, question.answer, "user", result.revision);
+      return result;
+    })();
   }
 
   function dismissQuestion(
@@ -1718,9 +1785,9 @@ export default async function plugin(bb: BbPluginApi) {
   async function dispatchQuestionToAgent(
     spec: SpecRecord,
     annotation: AnnotationRecord,
-    trigger: "asked" | "reply",
+    trigger: "asked" | "reply" | "accepted",
   ): Promise<boolean> {
-    if (!config.autoTriageQuestions) return false;
+    if (!config.autoTriageQuestions && trigger !== "accepted") return false;
     const question = annotationById(annotation.id);
     if (question === undefined || question.kind !== "question") return false;
     const commentRows = db
@@ -1733,7 +1800,9 @@ export default async function plugin(bb: BbPluginApi) {
       `This thread is the discussion thread for spec "${spec.title}" (slug "${spec.slug}").`,
       trigger === "asked"
         ? `A question was just asked on the spec and is dispatched to you.`
-        : `The user replied in the question's thread on the spec.`,
+        : trigger === "accepted"
+          ? "The user accepts the answer. Prepare a spec change with specs_propose and questionId; keep the question open for review. If no document change is necessary, record the answer with requiresSpecChange: false and explain why."
+          : `The user replied in the question's thread on the spec.`,
       `Question id: ${question.id}`,
       `Quoted text: ${truncate(question.quote, 200)}`,
       `Question: ${truncate(question.body, 600)}`,
@@ -1754,8 +1823,8 @@ export default async function plugin(bb: BbPluginApi) {
       ...(context === "" ? [] : ["", context]),
       "",
       `Reply IN the question's thread with specs_reply({ annotationId: "${question.id}", body }) so the user sees it where they asked.`,
-      "If the spec and project context settle it, record specs_answer as well; if it is underspecified, use specs_clarify with one sharp follow-up.",
-      "Do not edit the spec directly: when the question implies a change, create a proposal with specs_propose and resolve with the decision.",
+      "If the spec and project context settle it, record specs_answer with requiresSpecChange explicitly true or false. Ask follow-ups with specs_reply in this same conversation; do not create another question for clarification.",
+      "When the answer implies a change, create a proposal with specs_propose and questionId. Keep the question open: the user reviews and applies the proposal to accept and close it. Do not call specs_resolve on the user's behalf.",
     ].join("\n");
     try {
       const chat = await ensureChatThread(spec, message);
@@ -1802,6 +1871,13 @@ export default async function plugin(bb: BbPluginApi) {
     db.prepare(
       "INSERT INTO annotation_comments (id, annotation_id, body, author, created_at) VALUES (?, ?, ?, ?, ?)",
     ).run(id, annotationId, body, author, nowIso());
+    if (annotation.kind === "question" && author !== "agent" && annotation.status === "open") {
+      db.prepare("UPDATE annotations SET state = 'open', change_requested = 0, updated_at = ? WHERE id = ?").run(nowIso(), annotationId);
+      db.prepare("UPDATE proposals SET status = 'superseded', resolved_at = ?, resolution_note = 'User replied; awaiting a revised answer' WHERE question_id = ? AND status = 'pending'").run(nowIso(), annotationId);
+    }
+    db.prepare("UPDATE annotations SET updated_at = ? WHERE id = ?").run(
+      new Date(Math.max(Date.now(), Date.parse(annotation.updated_at) + 1)).toISOString(), annotationId,
+    );
     publishChanged(annotation.spec_id, "comment");
     if (
       options?.dispatch !== false &&
@@ -1901,6 +1977,10 @@ export default async function plugin(bb: BbPluginApi) {
       record.question_id,
       record.created_at,
     );
+    if (input.questionId !== undefined) {
+      db.prepare("UPDATE proposals SET status = 'superseded', resolved_at = ?, resolution_note = 'Replaced by a newer proposal' WHERE question_id = ? AND id != ? AND status = 'pending'").run(nowIso(), input.questionId, record.id);
+      db.prepare("UPDATE annotations SET change_requested = 0, requires_spec_change = 1 WHERE id = ?").run(input.questionId);
+    }
     publishChanged(spec.id, "proposal-created");
     return record;
   }
@@ -2642,7 +2722,7 @@ export default async function plugin(bb: BbPluginApi) {
         ? ""
         : [
             `Open questions: ${countState("open")} open · ${countState("answered")} awaiting triage · ${countState("clarify")} in clarification${textQuestionCount === 0 ? "" : ` · ${textQuestionCount} in text`}.`,
-            `List with specs_questions({ projectId }); promote text questions with specs_promote; close with specs_answer, specs_clarify, specs_resolve, or specs_dismiss.`,
+            `List with specs_questions({ projectId }); promote text questions with specs_promote; record answers with specs_answer; keep follow-ups in specs_reply and leave acceptance to the user.`,
           ].join(" ");
     const pendingProposals = db
       .prepare(
@@ -2949,7 +3029,7 @@ export default async function plugin(bb: BbPluginApi) {
     description:
       "Update a spec document's content, title, or summary. With the plugin's default agentWriteMode=propose this records a proposal the user reviews and applies; set agentWriteMode=direct to write immediately. Pass expectedRevision (from the latest specs_read) so a concurrent edit is reported instead of overwritten.",
     instructions:
-      "Prefer proposals for changes the user has not explicitly asked for: create the proposal, then resolve the question with the decision and mention the proposal id. Use direct writes only when the user asked for the edit in this conversation.",
+      "Prefer proposals for changes the user has not explicitly asked for. Link question-related proposals with questionId and leave the question open for the user to review and apply. Use direct writes only when the user asked for the edit in this conversation.",
     presentation: {
       label: { pending: "Updating spec", completed: "Updated spec" },
       icon: { glyph: "EditFile" },
@@ -2982,7 +3062,7 @@ export default async function plugin(bb: BbPluginApi) {
         if ("proposal" in result) {
           const proposal = result.proposal;
           return toolText(
-            `Created proposal ${proposal.id} against v${proposal.base_revision}. The user reviews and applies it in the Specs page; record the decision with specs_resolve and mention the proposal, and the applied revision links back automatically.`,
+            `Created proposal ${proposal.id} against v${proposal.base_revision}. The user reviews and applies it in the Specs page. For a linked question, record specs_answer and keep it open; Apply and close records the decision and applied revision together.`,
           );
         }
         const updated = result.spec;
@@ -3223,7 +3303,7 @@ export default async function plugin(bb: BbPluginApi) {
     description:
       "Reply inside a question's (or note's) comment thread. Questions dispatched to you must be answered here, in the thread where the user asked.",
     instructions:
-      "When a question is dispatched to you, reply with specs_reply on that annotation id, then record specs_answer or specs_clarify as appropriate.",
+      "When a question is dispatched to you, reply with specs_reply on that annotation id, record specs_answer if settled, or ask a follow-up with specs_reply in the same conversation. Leave acceptance to the user.",
     presentation: {
       label: { pending: "Replying in thread", completed: "Replied in thread" },
       icon: { glyph: "MessageSquare" },
@@ -3335,9 +3415,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "specs_answer",
     description:
-      "Answer an open question. The question moves to 'answered' and waits for triage: either it needs clarification (specs_clarify) or the decision is folded into the spec and closed (specs_resolve).",
+      "Record an answer for user acceptance. Set requiresSpecChange explicitly: false for an answer-only decision, true when a linked spec proposal is needed. Omission conservatively requires review of document impact.",
     instructions:
-      "Answer questions you can settle from the spec and project context; use specs_clarify when the question itself is under-specified.",
+      "Record the answer and explicitly set requiresSpecChange. If true, prepare a linked proposal with specs_propose. Leave acceptance to the user. Ask follow-ups with specs_reply in the same conversation.",
     presentation: {
       label: { pending: "Answering question", completed: "Answered question" },
       icon: { glyph: "Check" },
@@ -3345,10 +3425,11 @@ export default async function plugin(bb: BbPluginApi) {
     parameters: z.object({
       annotationId: z.string().min(1),
       answer: z.string().min(1).max(5000),
+      requiresSpecChange: z.boolean().optional().describe("Set false only when accepting this answer needs no spec change; otherwise true."),
     }),
-    execute: ({ annotationId, answer }) => {
+    execute: ({ annotationId, answer, requiresSpecChange }) => {
       try {
-        answerQuestion(annotationId, answer, "agent");
+        answerQuestion(annotationId, answer, "agent", requiresSpecChange);
         return toolText(`Answered ${annotationId}. It is now awaiting triage.`);
       } catch (error) {
         return toolError(error instanceof Error ? error.message : String(error));
@@ -3773,8 +3854,11 @@ export default async function plugin(bb: BbPluginApi) {
       return { id: created.id };
     },
 
-    questions_answer: ({ annotationId, answer }) => {
-      answerQuestion(annotationId, answer, "user");
+    questions_accept: ({ annotationId, expectedAnswer, expectedUpdatedAt }) => acceptQuestion(annotationId, expectedAnswer, expectedUpdatedAt),
+    questions_apply: ({ annotationId, proposalId, expectedAnswer, expectedUpdatedAt }) => applyQuestionProposal(annotationId, proposalId, expectedAnswer, expectedUpdatedAt),
+
+    questions_answer: ({ annotationId, answer, requiresSpecChange }) => {
+      answerQuestion(annotationId, answer, "user", requiresSpecChange);
       return { ok: true as const };
     },
 
@@ -4058,7 +4142,7 @@ export default async function plugin(bb: BbPluginApi) {
     "  bb specs questions [<id-or-slug>] [--state open|answered|clarify|resolved|dismissed|all] [--project <id>] [--json]",
     "  bb specs reply <annotation-id> <reply text> [--json]",
     "  bb specs promote <id-or-slug> <question text as written> [--json]",
-    "  bb specs answer <annotation-id> --text <answer> [--json]",
+    "  bb specs answer <annotation-id> --text <answer> [--no-spec-change] [--json]",
     "  bb specs clarify <annotation-id> <follow-up question> [--json]",
     "  bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]",
     "  bb specs dismiss <annotation-id> [--reason <text>] [--json]",
@@ -4103,7 +4187,7 @@ export default async function plugin(bb: BbPluginApi) {
       { name: "questions", summary: "List questions and their loop state", usage: "bb specs questions [<id-or-slug>] [--state <state>] [--project <id>] [--json]" },
       { name: "reply", summary: "Reply inside a question's thread", usage: "bb specs reply <annotation-id> <reply text> [--json]" },
       { name: "promote", summary: "Promote a question written in the spec text", usage: "bb specs promote <id-or-slug> <question text as written> [--json]" },
-      { name: "answer", summary: "Answer a question for triage", usage: "bb specs answer <annotation-id> --text <answer> [--json]" },
+      { name: "answer", summary: "Answer a question for triage", usage: "bb specs answer <annotation-id> --text <answer> [--no-spec-change] [--json]" },
       { name: "clarify", summary: "Ask a follow-up question", usage: "bb specs clarify <annotation-id> <follow-up question> [--json]" },
       { name: "resolve-question", summary: "Close a question with a decision", usage: "bb specs resolve-question <annotation-id> --decision <text> [--folded-revision <n>] [--json]" },
       { name: "dismiss", summary: "Drop a question without deciding", usage: "bb specs dismiss <annotation-id> [--reason <text>] [--json]" },
@@ -4645,6 +4729,7 @@ export default async function plugin(bb: BbPluginApi) {
               annotationId,
               answer,
               ctx.threadId === undefined ? "cli" : "agent",
+              flags.get("no-spec-change") !== true,
             );
             return reply(
               { ok: true, annotationId },

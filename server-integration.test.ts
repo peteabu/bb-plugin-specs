@@ -264,3 +264,25 @@ describe("project context modes", () => {
     expect(digest()).not.toContain(pinned.slug);
   });
 });
+
+describe("preparing a missing proposal", () => {
+  it("requests a linked proposal once and preserves retry after dispatch failure", async () => {
+    const host = await setup();
+    const spec = await host.create();
+    const question = await host.rpc<{ id: string }>("annotations_create", { specId: spec.id, quote: "Initial", body: "What interval?", kind: "question" });
+    await host.rpc("questions_answer", { annotationId: question.id, answer: "Seven days", requiresSpecChange: true });
+    const annotation = (await host.detail(spec.id)).annotations[0]!;
+    const input = { annotationId: question.id, expectedAnswer: annotation.answer, expectedUpdatedAt: annotation.updatedAt };
+    host.spawn.mockRejectedValueOnce(new Error("Offline"));
+    await expect(host.rpc("questions_accept", input)).rejects.toThrow(/Try accepting again/);
+    expect((await host.detail(spec.id)).annotations[0]!.changeRequested).toBe(false);
+    expect(await host.rpc("questions_accept", input)).toEqual({ status: "preparing" });
+    expect(await host.rpc("questions_accept", input)).toEqual({ status: "preparing" });
+    expect(host.spawn).toHaveBeenCalledTimes(2);
+    const current = await host.detail(spec.id);
+    expect(current.annotations[0]).toMatchObject({ state: "answered", changeRequested: true });
+    expect(current.spec.revision).toBe(1);
+    expect(current.decisions).toEqual([]);
+    expect(JSON.stringify(host.harness.inspection.sdk.calls)).toContain("The user accepts the answer");
+  });
+});

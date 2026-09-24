@@ -172,3 +172,84 @@ describe("workspace selection and saving", () => {
     await waitFor(() => expect(apply).toHaveBeenCalledWith({ proposalId: "metadata-proposal" }));
   });
 });
+
+function questionFixture(current: SpecDetail, overrides: Partial<SpecDetail["annotations"][number]> = {}) {
+  return {
+    id: "question-1", specId: current.spec.id, quote: "content", prefix: "", suffix: "", body: "What interval?",
+    author: "user", status: "open" as const, kind: "question" as const, state: "answered" as const,
+    answer: "Seven days", requiresSpecChange: false, changeRequested: false, answeredBy: "agent", answeredAt: current.spec.updatedAt,
+    parentId: null, decision: "", foldedRevision: null, resolvedBy: "", resolvedAt: null, dispatchedAt: null,
+    createdAt: current.spec.updatedAt, updatedAt: current.spec.updatedAt, comments: [], events: [], ...overrides,
+  };
+}
+
+describe("conversation-first decisions", () => {
+  it("offers acceptance and keeps response and decision queues disjoint", async () => {
+    const current = detail("Decisions");
+    current.annotations = [questionFixture(current), questionFixture(current, { id: "question-2", body: "Unanswered question", state: "open", answer: "" })];
+    const accept = vi.fn(async () => ({ status: "resolved" }));
+    const view = renderSlot({ component: Host }, { initial: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current, questions_accept: accept,
+    } });
+    await view.findByRole("heading", { name: "Decisions" });
+    fireEvent.click(view.getByRole("button", { name: "Comments" }));
+    expect(view.queryByRole("button", { name: "Edit answer" })).toBeNull();
+    expect(view.queryByRole("button", { name: "Needs clarification" })).toBeNull();
+    expect(view.queryByText("Unanswered question")).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Accept decision" }));
+    await waitFor(() => expect(accept).toHaveBeenCalledWith({ annotationId: "question-1", expectedAnswer: "Seven days", expectedUpdatedAt: current.spec.updatedAt }));
+    fireEvent.click(view.getByRole("button", { name: "Needs response 1" }));
+    expect(view.getByText("Unanswered question")).toBeTruthy();
+    expect(view.queryByText("What interval?")).toBeNull();
+  });
+  it("shows content and metadata review before applying and closing", async () => {
+    const current = detail("Review decision");
+    current.annotations = [questionFixture(current, { requiresSpecChange: true })];
+    current.proposals = [{ id: "question-proposal", specId: current.spec.id, baseRevision: 1, title: "Changed title", summary: "Changed summary", icon: "🧭", content: "Seven days in the spec", note: "Set interval", author: "agent", questionId: "question-1", status: "pending", resolutionNote: "", resolvedBy: "", resolvedAt: null, appliedRevision: null, createdAt: current.spec.updatedAt }];
+    const apply = vi.fn(async () => ({ revision: 2 }));
+    const view = renderSlot({ component: Host }, { initial: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current,
+      specs_diff: () => ({ from: 1, to: null, truncated: false, rows: [{ type: "add", text: "Seven days in the spec" }] }), questions_apply: apply,
+    } });
+    await view.findByRole("heading", { name: "Review decision" });
+    expect(view.queryByRole("button", { name: "Apply" })).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Comments" }));
+    fireEvent.click(view.getByRole("button", { name: "Review change" }));
+    await view.findByText("+ Seven days in the spec");
+    expect(view.getByText("Changed title", { exact: false })).toBeTruthy();
+    expect(apply).not.toHaveBeenCalled();
+    fireEvent.click(view.getByRole("button", { name: "Apply and close" }));
+    await waitFor(() => expect(apply).toHaveBeenCalledWith({ annotationId: "question-1", proposalId: "question-proposal", expectedAnswer: "Seven days", expectedUpdatedAt: current.spec.updatedAt }));
+  });
+  it("preserves failed replies and prevents acceptance with an unsent challenge", async () => {
+    const current = detail("Reply failure"); current.annotations = [questionFixture(current)];
+    const view = renderSlot({ component: Host }, { initial: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current,
+      annotations_comment: () => { throw new Error("Connection failed"); },
+    } });
+    await view.findByRole("heading", { name: "Reply failure" });
+    fireEvent.click(view.getByRole("button", { name: "Comments" }));
+    fireEvent.change(view.getByPlaceholderText("Reply or ask a follow-up…"), { target: { value: "Make it three days" } });
+    expect((view.getByRole("button", { name: "Accept decision" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(view.getByRole("button", { name: "Reply" }));
+    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("Connection failed"));
+    expect((view.getByPlaceholderText("Reply or ask a follow-up…") as HTMLInputElement).value).toBe("Make it three days");
+  });
+  it("prefills answer editing and preserves a failed save", async () => {
+    const current = detail("Edit recorded answer"); current.annotations = [questionFixture(current)];
+    const view = renderSlot({ component: Host }, { initial: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current,
+      questions_answer: () => { throw new Error("Save failed"); },
+    } });
+    await view.findByRole("heading", { name: "Edit recorded answer" });
+    fireEvent.click(view.getByRole("button", { name: "Comments" }));
+    fireEvent.keyDown(view.getByRole("button", { name: "More actions" }), { key: "Enter" });
+    fireEvent.click(await view.findByRole("menuitem", { name: "Edit answer" }));
+    expect((view.getByLabelText("Recorded answer") as HTMLTextAreaElement).value).toBe("Seven days");
+    expect(view.queryByRole("button", { name: "Accept decision" })).toBeNull();
+    fireEvent.change(view.getByLabelText("Recorded answer"), { target: { value: "Three days" } });
+    fireEvent.click(view.getByRole("button", { name: "Save answer" }));
+    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("Save failed"));
+    expect((view.getByLabelText("Recorded answer") as HTMLTextAreaElement).value).toBe("Three days");
+  });
+});

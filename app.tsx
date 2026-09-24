@@ -21,6 +21,8 @@ import {
   useRpc,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
+import { usePortalScopeProps } from "./lib/portal-scope";
 import type {
   Annotation,
   Decision,
@@ -154,7 +156,7 @@ function useAnnotationHighlights(
     const HighlightCtor = (
       globalThis as unknown as { Highlight?: new (...ranges: Range[]) => unknown }
     ).Highlight;
-    if (css.highlights !== undefined && HighlightCtor !== undefined) {
+    if (css?.highlights !== undefined && HighlightCtor !== undefined) {
       const token = {};
       css.highlights.set(HIGHLIGHT_NAME, new HighlightCtor(...ranges));
       highlightOwner.token = token;
@@ -669,12 +671,17 @@ interface DiffTarget {
   from: number;
   to: number | null;
   content?: string;
+  proposal?: Proposal;
+  annotation?: Annotation;
+  current?: SpecDetail["spec"];
 }
 
 function DiffDialog({
   target,
   onOpenChange,
+  onApplied,
 }: {
+  onApplied: () => void;
   target: DiffTarget | null;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -683,8 +690,12 @@ function DiffDialog({
     Array<{ type: "same" | "add" | "del"; text: string }> | null
   >(null);
   const [error, setError] = useState<string | null>(null);
+  const [applying, setApplying] = useState(false);
+  const [applyError, setApplyError] = useState<string | null>(null);
   useEffect(() => {
     if (target === null) return;
+    let active = true;
+    setApplyError(null);
     setRows(null);
     setError(null);
     rpc
@@ -695,12 +706,13 @@ function DiffDialog({
         ...(target.content === undefined ? {} : { content: target.content }),
       })
       .then(
-        (result) => setRows(result.rows),
-        (cause: unknown) => setError(messageOf(cause)),
+        (result) => { if (active) setRows(result.rows); },
+        (cause: unknown) => { if (active) setError(messageOf(cause)); },
       );
+    return () => { active = false; };
   }, [target, rpc]);
   return (
-    <Dialog open={target !== null} onOpenChange={onOpenChange}>
+    <Dialog open={target !== null} onOpenChange={(open) => { if (!applying) onOpenChange(open); }}>
       <DialogContent className="max-w-3xl rounded-2xl">
         <DialogHeader>
           <DialogTitle className="text-base">
@@ -709,6 +721,13 @@ function DiffDialog({
               : `${target.title} · v${target.from} → ${target.to === null ? "proposal" : `v${target.to}`}`}
           </DialogTitle>
         </DialogHeader>
+        {target?.proposal && target.current ? <dl className="space-y-1 text-sm">
+          {[
+            ["Title", target.current.title, target.proposal.title || target.current.title],
+            ["Summary", target.current.summary, target.proposal.summary],
+            ["Icon", target.current.icon, target.proposal.icon ?? target.current.icon],
+          ].filter(([, before, after]) => before !== after).map(([label, before, after]) => <div key={label}><dt className="font-medium">{label}</dt><dd><del>{before || "Empty"}</del> → {after || "Empty"}</dd></div>)}
+        </dl> : null}
         <div className="max-h-[60vh] overflow-auto rounded-xl border border-border bg-secondary/30">
           {error !== null ? (
             <p className="p-4 text-sm text-destructive">{error}</p>
@@ -733,10 +752,19 @@ function DiffDialog({
             </div>
           )}
         </div>
+        {applyError === null ? null : <p role="alert" className="text-sm text-destructive">{applyError}</p>}
         <DialogFooter>
-          <Button variant="ghost" onClick={() => onOpenChange(false)}>
-            Close
-          </Button>
+          <Button variant="ghost" disabled={applying} onClick={() => onOpenChange(false)}>Close</Button>
+          {target?.proposal && target.annotation ? <Button disabled={applying || rows === null || error !== null} onClick={async () => {
+            setApplying(true);
+            setApplyError(null);
+            try {
+              await rpc.call("questions_apply", { annotationId: target.annotation!.id, proposalId: target.proposal!.id, expectedAnswer: target.annotation!.answer, expectedUpdatedAt: target.annotation!.updatedAt });
+              onApplied();
+              onOpenChange(false);
+            } catch (cause) { setApplyError(messageOf(cause)); }
+            finally { setApplying(false); }
+          }}>{applying ? "Applying…" : "Apply and close"}</Button> : null}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -995,384 +1023,140 @@ function EmojiPickerDialog({
 // Comments rail
 // ---------------------------------------------------------------------------
 
-type QuestionAction = "answer" | "clarify" | "resolve" | "dismiss";
+type QuestionAction = "answer" | "dismiss";
 
 const QUESTION_STATE_LABELS: Record<Annotation["state"], string> = {
-  open: "Open",
-  answered: "Answered",
-  clarify: "Clarifying",
-  resolved: "Resolved",
-  dismissed: "Dismissed",
+  open: "Needs response", answered: "Needs decision", clarify: "Needs response",
+  resolved: "Closed", dismissed: "Dismissed",
 };
 
-function questionStateChip(state: Annotation["state"]): string {
-  if (state === "open") return "bg-primary/15 text-primary";
-  if (state === "answered") return "bg-secondary text-foreground";
-  return "bg-secondary/60 text-muted-foreground";
-}
-
-const QUESTION_FORMS: Record<
-  QuestionAction,
-  { placeholder: string; submit: string }
-> = {
-  answer: { placeholder: "Answer from the spec and project context…", submit: "Save answer" },
-  clarify: { placeholder: "What needs to be clearer before this can be decided?", submit: "Ask follow-up" },
-  resolve: { placeholder: "The decision, in one or two sentences…", submit: "Resolve" },
-  dismiss: { placeholder: "Why is this no longer worth deciding? (optional)", submit: "Dismiss" },
-};
-
-function CommentCard({
-  annotation,
-  onReply,
-  onStatus,
-  onRemove,
-  onLocate,
-  onAnswer,
-  onClarify,
-  onResolve,
-  onDismiss,
-  onReopen,
+function CommentCard({ annotation, proposal, onReply, onStatus, onRemove, onLocate,
+  onAnswer, onAccept, onReview, onDismiss, onReopen,
 }: {
   annotation: Annotation;
+  proposal?: Proposal;
   onReply: (body: string) => Promise<void>;
   onStatus: (status: "open" | "resolved") => Promise<void>;
   onRemove: () => Promise<void>;
   onLocate: () => void;
-  onAnswer: (answer: string) => Promise<void>;
-  onClarify: (question: string) => Promise<void>;
-  onResolve: (decision: string) => Promise<void>;
+  onAnswer: (answer: string, requiresSpecChange: boolean) => Promise<void>;
+  onAccept: () => Promise<void>;
+  onReview: (proposal: Proposal) => void;
   onDismiss: (reason: string) => Promise<void>;
   onReopen: () => Promise<void>;
 }) {
   const [reply, setReply] = useState("");
   const [form, setForm] = useState<QuestionAction | null>(null);
   const [formText, setFormText] = useState("");
+  const [requiresChange, setRequiresChange] = useState(annotation.requiresSpecChange);
   const [eventsOpen, setEventsOpen] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const portalScope = usePortalScopeProps();
   const isQuestion = annotation.kind === "question";
   const closed = annotation.status === "resolved";
-
+  const preparing = annotation.changeRequested && proposal === undefined;
+  const run = async (action: () => Promise<void>) => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try { await action(); } catch (cause) { setError(messageOf(cause)); }
+    finally { setBusy(false); }
+  };
   const sendReply = () => {
     const value = reply.trim();
     if (value === "") return;
-    setReply("");
-    void onReply(value);
+    void run(async () => { await onReply(value); setReply(""); });
   };
-
   const openForm = (action: QuestionAction) => {
     setForm(action);
-    setFormText("");
+    setFormText(action === "answer" ? annotation.answer : "");
+    setRequiresChange(annotation.requiresSpecChange);
+    setError(null);
   };
-
-  const submitForm = async () => {
-    if (form === null || busy) return;
-    const value = formText.trim();
-    if (value === "" && form !== "dismiss") return;
-    setBusy(true);
-    try {
-      if (form === "answer") await onAnswer(value);
-      else if (form === "clarify") await onClarify(value);
-      else if (form === "resolve") await onResolve(value);
-      else await onDismiss(value);
+  const submitForm = () => {
+    if (form === null || (form === "answer" && formText.trim() === "")) return;
+    void run(async () => {
+      if (form === "answer") await onAnswer(formText.trim(), requiresChange);
+      else await onDismiss(formText.trim());
       setForm(null);
-      setFormText("");
-    } finally {
-      setBusy(false);
-    }
+    });
   };
-
-  const hoverActions = (
-    <span className="ml-auto flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-within:opacity-100">
-      <IconButton label="Find in document" onClick={onLocate} compact>
-        <Icon name="Target" className="size-3.5" />
-      </IconButton>
-      {isQuestion ? null : (
-        <IconButton
-          label={closed ? "Reopen" : "Resolve"}
-          compact
-          onClick={() => {
-            if (busy) return;
-            setBusy(true);
-            void onStatus(closed ? "open" : "resolved").finally(() => setBusy(false));
-          }}
-        >
-          <Icon name="Check" className="size-3.5" />
-        </IconButton>
-      )}
-      <IconButton
-        label={confirming ? "Confirm delete" : "Delete"}
-        compact
-        onClick={() => {
-          if (!confirming) {
-            setConfirming(true);
-            return;
-          }
-          void onRemove();
-        }}
-        className={confirming ? "text-destructive" : undefined}
-      >
-        <Icon name="Trash2" className="size-3.5" />
-      </IconButton>
-    </span>
-  );
-
+  const menuItem = "cursor-pointer rounded-md px-2 py-1.5 text-xs outline-none focus:bg-secondary data-[disabled]:opacity-50";
   return (
-    <div
-      className={cn(
-        "specs-hairline group rounded-xl bg-card p-3",
-        closed && "opacity-80",
-      )}
-    >
-      <div className="flex items-start gap-2.5">
+    <div className="specs-hairline rounded-xl bg-card p-3">
+      <div className="flex items-center gap-2">
         <Avatar name={annotation.author} />
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-xs font-medium">
-              {displayAuthor(annotation.author)}
-            </span>
-            {isQuestion ? (
-              <span className="rounded-md bg-secondary px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                Question
-              </span>
-            ) : null}
-            {isQuestion ? (
-              <span
-                className={cn(
-                  "rounded-md px-1.5 py-0.5 text-[10px] font-medium",
-                  questionStateChip(annotation.state),
-                )}
-              >
-                {QUESTION_STATE_LABELS[annotation.state]}
-              </span>
-            ) : null}
-            <span className="text-[11px] text-muted-foreground tabular-nums">
-              {relativeTime(annotation.createdAt)}
-            </span>
-            {hoverActions}
-          </div>
-
-          <blockquote className="mt-1.5 border-l-2 border-primary/40 pl-2.5 text-xs leading-relaxed text-muted-foreground">
-            {truncate(annotation.quote, 180)}
-          </blockquote>
-          <div className="mt-1.5 text-sm leading-relaxed">
-            <Markdown content={annotation.body} />
-          </div>
-
-          {isQuestion &&
-          !closed &&
-          annotation.answer === "" &&
-          annotation.dispatchedAt !== null &&
-          !annotation.comments.some((comment) => comment.author === "agent") ? (
-            <p className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
-              <Icon name="Loading" className="size-3 animate-spin" />
-              Agent notified {relativeTime(annotation.dispatchedAt)} — it replies
-              in this thread
-            </p>
-          ) : null}
-
-          {isQuestion && annotation.answer !== "" ? (
-            <div className="mt-2 rounded-lg bg-secondary/50 px-2.5 py-2">
-              <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
-                Answer · {displayAuthor(annotation.answeredBy)} ·{" "}
-                {relativeTime(annotation.answeredAt ?? annotation.updatedAt)}
-              </p>
-              <div className="mt-0.5 text-sm leading-relaxed">
-                <Markdown content={annotation.answer} />
-              </div>
-            </div>
-          ) : null}
-
-          {isQuestion && annotation.decision !== "" ? (
-            <div className="mt-2 rounded-lg border border-border px-2.5 py-2">
-              <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground tabular-nums">
-                Decision · {displayAuthor(annotation.resolvedBy)} ·{" "}
-                {relativeTime(annotation.resolvedAt ?? annotation.updatedAt)}
-                {annotation.foldedRevision === null
-                  ? ""
-                  : ` · folded into v${annotation.foldedRevision}`}
-              </p>
-              <div className="mt-0.5 text-sm leading-relaxed">
-                <Markdown content={annotation.decision} />
-              </div>
-            </div>
-          ) : null}
-
-          {isQuestion && annotation.parentId !== null ? (
-            <p className="mt-1.5 text-[11px] text-muted-foreground">
-              Follow-up of {annotation.parentId}
-            </p>
-          ) : null}
-
-          {isQuestion && annotation.events.length > 0 ? (
-            <div className="mt-2">
-              <button
-                type="button"
-                onClick={() => setEventsOpen((current) => !current)}
-                className="specs-press cursor-pointer text-[11px] text-muted-foreground hover:text-foreground"
-              >
-                {eventsOpen ? "Hide history" : `History (${annotation.events.length})`}
-              </button>
-              {eventsOpen ? (
-                <ul className="mt-1.5 space-y-1 border-l border-border pl-2.5">
-                  {annotation.events.map((event) => (
-                    <li
-                      key={event.id}
-                      className="text-[11px] text-muted-foreground tabular-nums"
-                    >
-                      <span className="font-medium text-foreground/80">
-                        {event.event}
-                      </span>{" "}
-                      · {displayAuthor(event.actor)} · {relativeTime(event.createdAt)}
-                      {event.revision === null ? "" : ` · v${event.revision}`}
-                      {event.note === "" ? "" : ` — ${truncate(event.note, 120)}`}
-                    </li>
-                  ))}
-                </ul>
-              ) : null}
-            </div>
-          ) : null}
-
-          {isQuestion ? (
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              {closed ? (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 px-2.5"
-                  disabled={busy}
-                  onClick={() => {
-                    setBusy(true);
-                    void onReopen().finally(() => setBusy(false));
-                  }}
-                >
-                  Reopen
-                </Button>
-              ) : (
-                <>
-                  <Button
-                    size="sm"
-                    className="h-7 px-2.5"
-                    onClick={() => openForm("answer")}
-                  >
-                    {annotation.answer === "" ? "Answer" : "Edit answer"}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="h-7 px-2.5"
-                    onClick={() => openForm("clarify")}
-                  >
-                    Needs clarification
-                  </Button>
-                  {annotation.state === "answered" ? (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      className="h-7 px-2.5"
-                      onClick={() => openForm("resolve")}
-                    >
-                      Resolve with decision
-                    </Button>
-                  ) : null}
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 px-2.5 text-muted-foreground"
-                    onClick={() => openForm("dismiss")}
-                  >
-                    Dismiss
-                  </Button>
-                </>
-              )}
-            </div>
-          ) : null}
-
-          {form === null ? null : (
-            <div className="mt-2">
-              <textarea
-                autoFocus
-                value={formText}
-                onChange={(event) => setFormText(event.target.value)}
-                placeholder={QUESTION_FORMS[form].placeholder}
-                className={cn(textareaClassName, "h-20 rounded-xl text-sm")}
-                onKeyDown={(event) => {
-                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-                    event.preventDefault();
-                    void submitForm();
-                  }
-                  if (event.key === "Escape") setForm(null);
-                }}
-              />
-              <div className="mt-1.5 flex items-center justify-end gap-2">
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 px-2"
-                  onClick={() => setForm(null)}
-                >
-                  Cancel
-                </Button>
-                <Button
-                  size="sm"
-                  className="h-7 px-2.5"
-                  disabled={busy || (form !== "dismiss" && formText.trim() === "")}
-                  onClick={() => void submitForm()}
-                >
-                  {busy ? "Saving…" : QUESTION_FORMS[form].submit}
-                </Button>
-              </div>
-            </div>
-          )}
-
-          {annotation.comments.length > 0 ? (
-            <ul className="mt-2 space-y-2 border-t border-border pt-2">
-              {annotation.comments.map((comment) => (
-                <li key={comment.id} className="flex items-start gap-2">
-                  <Avatar name={comment.author} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-baseline gap-2">
-                      <span className="text-xs font-medium">
-                        {displayAuthor(comment.author)}
-                      </span>
-                      <span className="text-[11px] text-muted-foreground tabular-nums">
-                        {relativeTime(comment.createdAt)}
-                      </span>
-                    </div>
-                    <div className="text-sm leading-relaxed">
-                      <Markdown content={comment.body} />
-                    </div>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-
-          <div className="mt-2 flex items-center gap-2">
-            <Input
-              value={reply}
-              onChange={(event) => setReply(event.target.value)}
-              placeholder={isQuestion ? "Reply to the agent…" : "Reply…"}
-              className="h-7 text-xs"
-              onKeyDown={(event) => {
-                if (event.key === "Enter") {
-                  event.preventDefault();
-                  sendReply();
-                }
-              }}
-            />
-            <Button
-              size="sm"
-              variant="ghost"
-              className="h-7 px-2"
-              disabled={reply.trim() === ""}
-              onClick={sendReply}
-            >
-              Reply
-            </Button>
-          </div>
-        </div>
+        <span className="min-w-0 flex-1 text-xs font-medium">{displayAuthor(annotation.author)}</span>
+        <span className="text-[11px] text-muted-foreground">
+          {isQuestion ? preparing ? "Preparing change" : QUESTION_STATE_LABELS[annotation.state] : closed ? "Closed" : "Note"}
+        </span>
+        <DropdownMenu.Root>
+          <DropdownMenu.Trigger asChild>
+            <Button variant="ghost" size="sm" className="h-7 px-2" aria-label="More actions" disabled={busy}>More</Button>
+          </DropdownMenu.Trigger>
+          <DropdownMenu.Portal>
+            <DropdownMenu.Content {...portalScope} align="end" sideOffset={4} className="z-50 min-w-40 rounded-lg border border-border bg-background p-1 text-foreground shadow-md">
+              <DropdownMenu.Item className={menuItem} onSelect={onLocate}>Find in document</DropdownMenu.Item>
+              {isQuestion && !closed ? <DropdownMenu.Item className={menuItem} onSelect={() => openForm("answer")}>{annotation.answer ? "Edit answer" : "Record answer"}</DropdownMenu.Item> : null}
+              {isQuestion && !closed ? <DropdownMenu.Item className={menuItem} onSelect={() => openForm("dismiss")}>Dismiss question</DropdownMenu.Item> : null}
+              {closed ? <DropdownMenu.Item className={menuItem} onSelect={() => void run(isQuestion ? onReopen : () => onStatus("open"))}>Reopen</DropdownMenu.Item> : null}
+              {!isQuestion && !closed ? <DropdownMenu.Item className={menuItem} onSelect={() => void run(() => onStatus("resolved"))}>Resolve note</DropdownMenu.Item> : null}
+              {annotation.events.length > 0 ? <DropdownMenu.Item className={menuItem} onSelect={() => setEventsOpen(!eventsOpen)}>{eventsOpen ? "Hide history" : "View history"}</DropdownMenu.Item> : null}
+              <DropdownMenu.Item className={cn(menuItem, "text-destructive")} onSelect={() => setConfirming(true)}>Delete</DropdownMenu.Item>
+            </DropdownMenu.Content>
+          </DropdownMenu.Portal>
+        </DropdownMenu.Root>
       </div>
+      {annotation.quote.trim() === annotation.body.trim() ? null : <blockquote className="mt-2 border-l-2 border-primary/40 pl-2.5 text-xs text-muted-foreground">{truncate(annotation.quote, 180)}</blockquote>}
+      <div className="mt-2 text-sm leading-relaxed"><Markdown content={annotation.body} /></div>
+      {annotation.comments.length > 0 ? <ul className="mt-3 space-y-3 border-l border-border pl-3">
+        {annotation.comments.map((comment) => <li key={comment.id}>
+          <p className="text-xs font-medium">{displayAuthor(comment.author)} <span className="font-normal text-muted-foreground">· {relativeTime(comment.createdAt)}</span></p>
+          <div className="mt-1 text-sm leading-relaxed"><Markdown content={comment.body} /></div>
+        </li>)}
+      </ul> : null}
+      {isQuestion && annotation.answer !== "" && !annotation.comments.some((comment) => comment.body === annotation.answer) ? <div className="mt-3 rounded-lg bg-secondary/50 p-2.5">
+        <p className="text-[11px] font-medium text-muted-foreground">{annotation.state === "open" || annotation.state === "clarify" ? "Previous answer · awaiting response" : "Answer"}</p>
+        <div className="mt-1 text-sm leading-relaxed"><Markdown content={annotation.answer} /></div>
+      </div> : null}
+      {closed && annotation.decision !== "" ? <div className="mt-2 text-sm">
+        <p className="text-[11px] font-medium text-muted-foreground">Decision{annotation.foldedRevision === null ? "" : ` · applied in v${annotation.foldedRevision}`}</p>
+        <Markdown content={annotation.decision} />
+      </div> : null}
+      {isQuestion && !closed && annotation.state !== "answered" ? <p className="mt-2 text-xs text-muted-foreground">Waiting for a response.</p> : null}
+      {preparing ? <p className="mt-2 text-xs text-muted-foreground">The agent is preparing the spec change for your review.</p> : null}
+      {eventsOpen ? <ul className="mt-2 space-y-1 border-l border-border pl-2.5">
+        {annotation.events.map((event) => <li key={event.id} className="text-[11px] text-muted-foreground">{event.event} · {displayAuthor(event.actor)} · {relativeTime(event.createdAt)}{event.revision === null ? "" : ` · v${event.revision}`}{event.note ? ` — ${event.note}` : ""}</li>)}
+      </ul> : null}
+      {form !== null ? <div className="mt-3">
+        <textarea autoFocus aria-label={form === "answer" ? "Recorded answer" : "Dismissal reason"} value={formText} onChange={(event) => setFormText(event.target.value)} placeholder={form === "answer" ? "Answer…" : "Reason (optional)"} className={cn(textareaClassName, "h-24 rounded-xl text-sm")} onKeyDown={(event) => {
+          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") { event.preventDefault(); submitForm(); }
+          if (event.key === "Escape" && !busy) setForm(null);
+        }} />
+        {form === "answer" ? <label className="mt-2 flex items-center gap-2 text-xs"><input type="checkbox" checked={requiresChange} onChange={(event) => setRequiresChange(event.target.checked)} />Requires a spec change</label> : null}
+        <div className="mt-2 flex justify-end gap-2">
+          <Button size="sm" variant="ghost" disabled={busy} onClick={() => setForm(null)}>Cancel</Button>
+          <Button size="sm" disabled={busy || (form === "answer" && !formText.trim())} onClick={submitForm}>{busy ? "Saving…" : form === "answer" ? "Save answer" : "Dismiss question"}</Button>
+        </div>
+      </div> : !closed ? <div className="mt-3 space-y-2">
+        {isQuestion && annotation.state === "answered" && !preparing ? <>
+          {proposal === undefined && annotation.requiresSpecChange ? <p className="text-xs text-muted-foreground">Accepting asks the agent to prepare a spec change for review.</p> : null}
+          <Button size="sm" disabled={busy || reply.trim() !== ""} onClick={() => proposal === undefined ? void run(onAccept) : onReview(proposal)}>{proposal === undefined ? "Accept decision" : "Review change"}</Button>
+        </> : null}
+        <div className="flex items-center gap-2">
+          <Input value={reply} onChange={(event) => setReply(event.target.value)} placeholder={isQuestion ? "Reply or ask a follow-up…" : "Reply…"} className="h-8 text-xs" disabled={busy} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); sendReply(); } }} />
+          <Button size="sm" variant="ghost" disabled={busy || !reply.trim()} onClick={sendReply}>Reply</Button>
+        </div>
+      </div> : null}
+      {error === null ? null : <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
+      <Dialog open={confirming} onOpenChange={setConfirming}>
+        <DialogContent><DialogHeader><DialogTitle>Delete this {isQuestion ? "question" : "note"}?</DialogTitle></DialogHeader>
+          <p className="text-sm text-muted-foreground">This removes the conversation. This cannot be undone.</p>
+          <DialogFooter><Button variant="ghost" disabled={busy} onClick={() => setConfirming(false)}>Cancel</Button><Button disabled={busy} onClick={() => void run(async () => { await onRemove(); setConfirming(false); })}>Delete</Button></DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -1388,8 +1172,9 @@ function CommentsRail({
   onRemove,
   onLocate,
   onAnswer,
-  onClarify,
-  onResolve,
+  onAccept,
+  onReview,
+  proposals,
   onDismiss,
   onReopen,
   onPromote,
@@ -1403,18 +1188,20 @@ function CommentsRail({
   onStatus: (annotationId: string, status: "open" | "resolved") => Promise<void>;
   onRemove: (annotationId: string) => Promise<void>;
   onLocate: (annotation: Annotation) => void;
-  onAnswer: (annotationId: string, answer: string) => Promise<void>;
-  onClarify: (annotationId: string, question: string) => Promise<void>;
-  onResolve: (annotationId: string, decision: string) => Promise<void>;
+  onAnswer: (annotationId: string, answer: string, requiresSpecChange: boolean) => Promise<void>;
+  onAccept: (annotation: Annotation) => Promise<void>;
+  onReview: (proposal: Proposal, annotation: Annotation) => void;
+  proposals: Proposal[];
   onDismiss: (annotationId: string, reason: string) => Promise<void>;
   onReopen: (annotationId: string) => Promise<void>;
   onPromote: (text: string) => Promise<void>;
 }) {
-  const [filter, setFilter] = useState<"open" | "answered" | "history">("open");
+  const [filter, setFilter] = useState<"open" | "answered" | "history">(() => annotations.some((annotation) => annotation.status === "open" && annotation.state === "answered" && !annotation.changeRequested) ? "answered" : "open");
   const [promoting, setPromoting] = useState<string | null>(null);
-  const openItems = annotations.filter((annotation) => annotation.status === "open");
+  const awaitingDecision = (annotation: Annotation) => annotation.status === "open" && annotation.kind === "question" && annotation.state === "answered" && (!annotation.changeRequested || proposals.some((proposal) => proposal.questionId === annotation.id));
+  const openItems = annotations.filter((annotation) => annotation.status === "open" && !awaitingDecision(annotation));
   const answeredItems = annotations.filter(
-    (annotation) => annotation.kind === "question" && annotation.state === "answered",
+    awaitingDecision,
   );
   const historyItems = annotations
     .filter((annotation) => annotation.status === "resolved")
@@ -1428,15 +1215,18 @@ function CommentsRail({
         ? answeredItems
         : historyItems;
   const segments: Array<["open" | "answered" | "history", string, number]> = [
-    ["open", "Open", openItems.length],
-    ["answered", "Answered", answeredItems.length],
-    ["history", "History", historyItems.length],
+    ["open", "Needs response", openItems.length],
+    ["answered", "Needs decision", answeredItems.length],
+    ["history", "Closed", historyItems.length],
   ];
 
   return (
     <>
-      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
-        <span className="min-w-0 flex-1 text-xs font-medium">Comments</span>
+      <div className="shrink-0 space-y-2 border-b border-border p-3">
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-xs font-medium">Questions & notes</span>
+          <IconButton label="Close comments" onClick={onClose}><Icon name="X" className="size-3.5" /></IconButton>
+        </div>
         <div className="flex items-center rounded-lg bg-secondary/60 p-0.5">
           {segments.map(([value, label, count]) => (
             <button
@@ -1455,9 +1245,6 @@ function CommentsRail({
             </button>
           ))}
         </div>
-        <IconButton label="Close comments" onClick={onClose}>
-          <Icon name="X" className="size-3.5" />
-        </IconButton>
       </div>
       <div className="specs-scroll min-h-0 flex-1 space-y-2.5 overflow-y-auto p-3">
         {filter === "open" && textQuestions.length > 0 ? (
@@ -1509,7 +1296,7 @@ function CommentsRail({
               {filter === "open"
                 ? "No open comments or questions. Select text in the document to add one."
                 : filter === "answered"
-                  ? "No answers waiting for triage."
+                  ? "No answers waiting for your decision."
                   : "No decisions or resolved comments yet."}
             </EmptyState>
           </div>
@@ -1522,9 +1309,10 @@ function CommentsRail({
               onStatus={(status) => onStatus(annotation.id, status)}
               onRemove={() => onRemove(annotation.id)}
               onLocate={() => onLocate(annotation)}
-              onAnswer={(answer) => onAnswer(annotation.id, answer)}
-              onClarify={(question) => onClarify(annotation.id, question)}
-              onResolve={(decision) => onResolve(annotation.id, decision)}
+              proposal={proposals.find((proposal) => proposal.questionId === annotation.id)}
+              onAnswer={(answer, requiresSpecChange) => onAnswer(annotation.id, answer, requiresSpecChange)}
+              onAccept={async () => { await onAccept(annotation); if (annotation.requiresSpecChange) setFilter("open"); }}
+              onReview={(proposal) => onReview(proposal, annotation)}
               onDismiss={(reason) => onDismiss(annotation.id, reason)}
               onReopen={() => onReopen(annotation.id)}
             />
@@ -2546,7 +2334,7 @@ export function SpecsWorkspace({
                         }
                       />
                     )}
-                    {detail.proposals.map((proposal) => (
+                    {detail.proposals.filter((proposal) => !detail.annotations.some((annotation) => annotation.id === proposal.questionId && annotation.status === "open")).map((proposal) => (
                       <ProposalCard
                         current={detail.spec}
                         key={proposal.id}
@@ -2619,9 +2407,10 @@ export function SpecsWorkspace({
       </main>
 
       {detail !== null && rail !== "none" ? (
-        <aside className="specs-rail absolute inset-y-0 right-0 z-40 flex w-full flex-col overflow-hidden border-l border-border bg-background md:static md:w-[340px] md:shrink-0">
+        <aside className="specs-rail absolute inset-y-0 right-0 z-40 flex w-full flex-col overflow-hidden border-l border-border bg-background md:static md:w-[380px] md:shrink-0">
           {rail === "comments" ? (
             <CommentsRail
+              key={detail.spec.id}
               annotations={detail.annotations}
               decisions={detail.decisions}
               textQuestions={detail.textQuestions}
@@ -2632,7 +2421,7 @@ export function SpecsWorkspace({
                   await rpc.call("annotations_comment", { annotationId, body });
                   refetchDetail(selectedSlug);
                 } catch (cause) {
-                  toast.error(messageOf(cause));
+                  throw cause;
                 }
               }}
               onStatus={async (annotationId, status) => {
@@ -2640,7 +2429,7 @@ export function SpecsWorkspace({
                   await rpc.call("annotations_set_status", { annotationId, status });
                   refetchDetail(selectedSlug);
                 } catch (cause) {
-                  toast.error(messageOf(cause));
+                  throw cause;
                 }
               }}
               onRemove={async (annotationId) => {
@@ -2649,36 +2438,29 @@ export function SpecsWorkspace({
                   toast.success("Comment removed");
                   refetchDetail(selectedSlug);
                 } catch (cause) {
-                  toast.error(messageOf(cause));
+                  throw cause;
                 }
               }}
               onLocate={locateAnnotation}
-              onAnswer={async (annotationId, answer) => {
+              onAnswer={async (annotationId, answer, requiresSpecChange) => {
                 try {
-                  await rpc.call("questions_answer", { annotationId, answer });
-                  toast.success("Answered — waiting for triage");
+                  await rpc.call("questions_answer", { annotationId, answer, requiresSpecChange });
+                  toast.success("Answer saved");
                   refetchDetail(selectedSlug);
                 } catch (cause) {
-                  toast.error(messageOf(cause));
+                  throw cause;
                 }
               }}
-              onClarify={async (annotationId, question) => {
-                try {
-                  await rpc.call("questions_clarify", { annotationId, question });
-                  toast.success("Follow-up question added");
-                  refetchDetail(selectedSlug);
-                } catch (cause) {
-                  toast.error(messageOf(cause));
-                }
-              }}
-              onResolve={async (annotationId, decision) => {
-                try {
-                  await rpc.call("questions_resolve", { annotationId, decision });
-                  toast.success("Question resolved");
-                  refetchDetail(selectedSlug);
-                } catch (cause) {
-                  toast.error(messageOf(cause));
-                }
+              proposals={detail.proposals}
+              onReview={(proposal, annotation) => setDiffTarget({
+                specId: detail.spec.id, title: proposal.note || detail.spec.title,
+                from: proposal.baseRevision, to: null, content: proposal.content,
+                proposal, annotation, current: detail.spec,
+              })}
+              onAccept={async (annotation) => {
+                await rpc.call("questions_accept", { annotationId: annotation.id, expectedAnswer: annotation.answer, expectedUpdatedAt: annotation.updatedAt });
+                refetchDetail(selectedSlug);
+                refetchList();
               }}
               onDismiss={async (annotationId, reason) => {
                 try {
@@ -2686,7 +2468,7 @@ export function SpecsWorkspace({
                   toast.success("Question dismissed");
                   refetchDetail(selectedSlug);
                 } catch (cause) {
-                  toast.error(messageOf(cause));
+                  throw cause;
                 }
               }}
               onReopen={async (annotationId) => {
@@ -2694,7 +2476,7 @@ export function SpecsWorkspace({
                   await rpc.call("questions_reopen", { annotationId });
                   refetchDetail(selectedSlug);
                 } catch (cause) {
-                  toast.error(messageOf(cause));
+                  throw cause;
                 }
               }}
               onPromote={async (text) => {
@@ -3022,6 +2804,7 @@ export function SpecsWorkspace({
       </Dialog>
 
       <DiffDialog
+        onApplied={() => { refetchDetail(selectedSlug); refetchList(); toast.success("Spec updated and question closed"); }}
         target={diffTarget}
         onOpenChange={(open) => {
           if (!open) setDiffTarget(null);

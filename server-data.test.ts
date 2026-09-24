@@ -250,3 +250,69 @@ it("deletes all owned records, cancels active research, and detaches retained ch
   expect(await rpc("decisions_list", {})).toEqual({ decisions: [] });
   await expect(detail(spec.id)).rejects.toThrow(/No spec matches/);
 });
+
+describe("question acceptance", () => {
+  async function answered(requiresSpecChange = false) {
+    const spec = await create();
+    const question = await rpc<{ id: string }>("annotations_create", { specId: spec.id, quote: "User", body: "What interval?", kind: "question" });
+    await agent("specs_answer", { annotationId: question.id, answer: "Seven days", requiresSpecChange });
+    const annotation = (await detail(spec.id)).annotations[0]!;
+    return { spec, input: { annotationId: question.id, expectedAnswer: annotation.answer, expectedUpdatedAt: annotation.updatedAt } };
+  }
+  it("accepts an answer-only decision once without editing the spec", async () => {
+    const { spec, input } = await answered();
+    expect(await rpc("questions_accept", input)).toEqual({ status: "resolved" });
+    expect((await detail(spec.id)).spec.revision).toBe(1);
+    expect((await detail(spec.id)).decisions).toEqual([expect.objectContaining({ decision: "Seven days", decidedBy: "user" })]);
+    await expect(rpc("questions_accept", input)).rejects.toThrow(/Wait for an answer/);
+    expect(await agent("specs_answer", { annotationId: input.annotationId, answer: "Late reply" })).toMatchObject({ isError: true });
+  });
+  it("invalidates pending proposals on a user reply and rejects stale answers", async () => {
+    const { spec, input } = await answered(true);
+    await agent("specs_propose", { idOrSlug: spec.id, content: "Seven days", questionId: input.annotationId });
+    const proposal = (await detail(spec.id)).proposals[0]!;
+    await rpc("annotations_comment", { annotationId: input.annotationId, body: "Make it three days" });
+    await expect(rpc("questions_accept", input)).rejects.toThrow(/Wait for an answer/);
+    await expect(rpc("questions_apply", { ...input, proposalId: proposal.id })).rejects.toThrow(/Wait for an answer/);
+    expect((await detail(spec.id)).annotations).toHaveLength(1);
+    expect((await detail(spec.id)).proposals).toEqual([]);
+    await agent("specs_answer", { annotationId: input.annotationId, answer: "Three days", requiresSpecChange: false });
+    await expect(rpc("questions_accept", input)).rejects.toThrow(/changed/);
+  });
+  it("requires review and applies metadata, document, and decision together", async () => {
+    const { spec, input } = await answered(true);
+    await agent("specs_propose", { idOrSlug: spec.id, content: "Seven days", title: "New title", summary: "Summary", icon: "🧭", questionId: input.annotationId });
+    const proposal = (await detail(spec.id)).proposals[0]!;
+    await expect(rpc("questions_accept", input)).rejects.toThrow(/Review/);
+    expect(await rpc("questions_apply", { ...input, proposalId: proposal.id })).toEqual({ revision: 2 });
+    const current = await detail(spec.id);
+    expect(current.spec).toMatchObject({ revision: 2, content: "Seven days", title: "New title", summary: "Summary", icon: "🧭" });
+    expect(current.annotations[0]).toMatchObject({ state: "resolved", foldedRevision: 2 });
+    expect(current.decisions).toEqual([expect.objectContaining({ revision: 2, questionId: input.annotationId })]);
+  });
+  it("rejects unrelated or stale proposals without closing the question", async () => {
+    const { spec, input } = await answered(true);
+    await agent("specs_propose", { idOrSlug: spec.id, content: "Unrelated" });
+    await expect(rpc("questions_apply", { ...input, proposalId: (await detail(spec.id)).proposals[0]!.id })).rejects.toThrow(/does not belong/);
+    await agent("specs_propose", { idOrSlug: spec.id, content: "Seven days", questionId: input.annotationId });
+    const proposal = (await detail(spec.id)).proposals.find((p) => p.questionId === input.annotationId)!;
+    await rpc("specs_save", { id: spec.id, content: "Concurrent edit", expectedRevision: 1 });
+    await expect(rpc("questions_apply", { ...input, proposalId: proposal.id })).rejects.toThrow(/stale/);
+    const current = await detail(spec.id);
+    expect(current.spec.content).toBe("Concurrent edit");
+    expect(current.annotations[0]!.state).toBe("answered");
+    expect(current.decisions).toEqual([]);
+  });
+  it("rolls back the document and proposal when decision persistence fails", async () => {
+    const { spec, input } = await answered(true);
+    await agent("specs_propose", { idOrSlug: spec.id, content: "Seven days", questionId: input.annotationId });
+    const proposal = (await detail(spec.id)).proposals[0]!;
+    host.bb.storage.database().exec("CREATE TRIGGER fail_decision BEFORE INSERT ON decisions BEGIN SELECT RAISE(ABORT, 'Decision failed'); END");
+    await expect(rpc("questions_apply", { ...input, proposalId: proposal.id })).rejects.toThrow(/Decision failed/);
+    const current = await detail(spec.id);
+    expect(current.spec).toMatchObject({ revision: 1, content: "User content" });
+    expect(current.proposals[0]!.status).toBe("pending");
+    expect(current.annotations[0]).toMatchObject({ state: "answered", foldedRevision: null });
+    expect(current.annotations[0]!.events.some((event) => event.event === "applied")).toBe(false);
+  });
+});

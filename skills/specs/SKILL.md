@@ -41,39 +41,31 @@ and manual runs.
 
 ## The question loop
 
-Questions are annotations with `kind: "question"` and a lifecycle. Run the loop
-instead of answering once and moving on:
+1. Fetch questions with `specs_questions`.
+2. Reply with `specs_reply` in the question's own conversation. Ask any follow-up
+   there too; do not create another question merely to clarify the answer.
+3. When the context supports an answer, record `specs_answer` with
+   `requiresSpecChange: false` if no document edit is needed, or `true` if it is.
+   Omission conservatively requires checking document impact. CLI equivalent:
+   `bb specs answer <id> --text <answer> --no-spec-change` for answer-only decisions.
+4. If a spec change is needed, create a proposal with `specs_propose`, `questionId`,
+   and `expectedRevision`. Leave the question open for user review.
+5. The user chooses **Accept decision** for an answer-only decision, or
+   **Review change → Apply and close** for a linked proposal. Apply and close
+   saves the document, attributed decision, and question resolution atomically.
+   If the proposal is missing, acceptance asks the agent to prepare it; the
+   question remains pending until reviewed. Do not resolve on the user's behalf.
 
-1. **Fetch** with `specs_questions` (or `bb specs questions`). States sort as
-   `answered` (triage inbox) → `open` → `clarify` → closed.
-2. **Questions asked by the user are dispatched to you.** When the user asks in
-   the UI or from a standalone CLI, the plugin sends the question to the spec's
-   agent thread; a user reply in the thread dispatches another turn. When that
-   happens:
-   - **Reply in the question's own thread** with
-     `specs_reply({ annotationId, body })` — that is where the user is reading.
-   - Then record `specs_answer` if the spec and project context settle it, or
-     `specs_clarify` with one sharp follow-up if not.
-   - Never edit the spec unless the question asks for it. CLI runs inside a
-     thread do not re-dispatch, so replies made with `bb specs reply` cannot
-     loop.
-3. **Answer** with `specs_answer` when the spec and project context settle it.
-   The question moves to `answered` and waits for triage.
-3. **Triage the answer**: is it enough to decide?
-   - No → `specs_clarify` with one sharp follow-up. The parent moves to
-     `clarify` and the follow-up appears as a new open question.
-   - Yes → fold the decision into the document:
-     `specs_write` the changed content, then `specs_resolve` with the decision
-     and the new revision as `foldedRevision`.
-4. **Dismiss** (`specs_dismiss`) only when no decision is needed; the reason is
-   recorded.
+A user reply continues the same conversation, returns the question to waiting
+for a response, and supersedes its pending proposal. Record a fresh answer and
+proposal after incorporating the reply. Closed questions must be explicitly
+reopened before answering again. Existing clarification tools remain available
+for distinct linked questions, but are not the normal follow-up path.
 
-Every transition is append-only in each question's `events` history: who asked,
-answered, clarified, decided, or dismissed, when, and which revision carries a
-folded decision. `specs_read` returns open questions and the decision audit
-trail, so a later thread can see why the spec says what it says. Never edit a
-decided question's decision into silence — reopen it (`specs_reopen`) or open a
-new question that references it.
+The UI keeps Edit answer, Dismiss, Reopen, Delete, and History in More. Discussion,
+answers, decisions, and revision events remain separate records in the audit
+trail. `specs_resolve` remains available for explicitly authorized decisions
+outside the user-review flow; do not use it to bypass acceptance.
 
 ## Questions written in the text
 
@@ -102,8 +94,8 @@ are labelled "not audited".
 - **People own the document.** With the default `agentWriteMode=propose`,
   `specs_write` and agent-thread `bb specs write` calls record a proposal the user reviews and applies, including title, summary, and icon edits (the UI shows a
   diff with Apply / Reject). Link a proposal to the question it answers with
-  `questionId`; applying it then links the new revision to that decision and
-  records an `applied` event. Use `specs_propose` for edits you initiate and
+  `questionId`; **Apply and close** records the decision, links its revision, and closes
+  the question together. Standalone proposals retain Apply / Reject. Use `specs_propose` for edits you initiate and
   `specs_write` when the user explicitly asked for the edit.
   Pass the revision you read as `expectedRevision` (CLI: `--expected-revision`)
   on writes and proposals; stale submissions are rejected. A linked question
