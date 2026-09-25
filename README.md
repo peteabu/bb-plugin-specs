@@ -57,6 +57,50 @@ proposals, decisions, and research records, and stops and archives active
 research and chat threads. Completed research reports remain as independent
 specs; their parent reference is cleared. Archived thread history is retained.
 
+## Research, conversation, and diagrams
+
+Research reports appear beneath their parent in navigation, with a parent link
+and incorporation status in the report. Once the report has no unresolved
+questions (including questions still in its text) or pending proposals, Specs
+prepares a parent update automatically. Review the diff and **Apply to parent**
+to incorporate it. The report then links to that exact parent revision.
+Changes to findings invalidate older updates; interruptions and parent revision
+conflicts offer **Prepare parent update** to retry. Existing reports are not
+all dispatched on installation: preparation starts after a report changes or
+when explicitly requested.
+
+Specs open ready to edit: click the title, summary, or document and type.
+Changes autosave, with revision conflicts and recovery controls shown when
+needed. There is no Edit/Done mode. Select text for formatting, comments, or
+**Ask agent**; `/` and `@agent` are always available.
+
+Markdown tables render as editable cells, retaining header alignment, inline
+formatting, and escaped pipes when saved. Task lists have interactive checkboxes;
+Click a checkbox to toggle it. For keyboard use, press Left at the start of
+the task text to focus its checkbox, then Space to toggle it.
+Use `/table` or `/checklist` to insert these blocks, or paste their Markdown.
+Nested lists and strikethrough retain their formatting in the editor.
+
+In the document, type `@agent` and choose **Draft here** (Enter also
+selects it). Describe the prose, code, or Mermaid diagram you want at that
+position, then click **Draft**. Current edits save first, and the request goes
+to the spec's agent. Review and apply its document proposal when ready.
+Cancel/Escape dismisses the prompt; failed requests stay available to retry.
+Mentions inside code are literal text. `@agent` uses this spec's existing agent;
+it is not a picker for other agents.
+
+The spec chat has one **Send** action. Sending the first message creates its
+conversation; subsequent messages continue it. Document edits use the normal
+proposal review flow (unless direct editing is configured).
+
+Standalone fenced `mermaid` blocks render as diagrams. **Edit source** gives a
+live preview within the document; **Save diagram** updates the same autosaved draft. **Discuss
+diagram** attaches the source to a chat draft; **Add diagram**
+starts a draft asking the agent to propose one in the document. The editor's
+`/diagram` command inserts a diagram block with its source editor open. Rendering uses Mermaid's
+strict mode and displays SVG as an isolated image; invalid source remains
+readable and editable.
+
 ## Development
 
 ```

@@ -7,7 +7,7 @@
 //   - native agent tools (specs_read / specs_write / specs_search / ...)
 //   - the per-resolution context digest injected into project threads
 //   - realtime signals so every open page refetches
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { isAbsolute, resolve as resolvePath } from "node:path";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
@@ -27,6 +27,7 @@ const specSummarySchema = z.object({
   updatedAt: z.string(),
   projectIds: z.array(z.string()),
   openAnnotations: z.number().int(),
+  parent: z.object({ id: z.string(), title: z.string(), slug: z.string() }).nullable(),
 });
 export type SpecSummary = z.infer<typeof specSummarySchema>;
 
@@ -98,6 +99,7 @@ const proposalSchema = z.object({
   note: z.string(),
   author: z.string(),
   questionId: z.string().nullable(),
+  researchId: z.string().nullable(),
   status: z.enum(["pending", "applied", "rejected", "superseded"]),
   resolutionNote: z.string(),
   resolvedBy: z.string(),
@@ -128,6 +130,10 @@ const researchSchema = z.object({
   threadId: z.string(),
   status: z.enum(["running", "done", "failed", "cancelled"]),
   resultSpecId: z.string().nullable(),
+  integrationState: z.enum(["pending", "waiting", "preparing", "review", "incorporated", "failed", "rejected"]),
+  integrationError: z.string(),
+  proposalId: z.string().nullable(),
+  incorporatedRevision: z.number().int().nullable(),
   error: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -183,6 +189,7 @@ export type SpecDetail = {
   proposals: Proposal[];
   decisions: Decision[];
   research: Research[];
+  sourceResearch: Research | null;
   discussion: SpecMessage[];
   agentChange: {
     revision: number;
@@ -226,6 +233,7 @@ export const rpcContract = defineRpcContract({
       proposals: z.array(proposalSchema),
       decisions: z.array(decisionSchema),
       research: z.array(researchSchema),
+      sourceResearch: researchSchema.nullable(),
       discussion: z.array(specMessageSchema),
       agentChange: z
         .object({
@@ -376,6 +384,10 @@ export const rpcContract = defineRpcContract({
     input: z.object({ id: z.string(), toRevision: z.number().int() }),
     output: z.object({ revision: z.number().int() }),
   },
+  research_prepare: {
+    input: z.object({ researchId: z.string() }),
+    output: z.object({ ok: z.literal(true) }),
+  },
   research_start: {
     input: z.object({
       specId: z.string(),
@@ -394,6 +406,15 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       specId: z.string(),
       text: z.string().trim().min(1).max(5000),
+    }),
+    output: z.object({ ok: z.literal(true), threadId: z.string() }),
+  },
+  chat_draft: {
+    input: z.object({
+      specId: z.string(),
+      text: z.string().trim().min(1).max(5000),
+      expectedRevision: z.number().int().min(1),
+      insertionOffset: z.number().int().min(0),
     }),
     output: z.object({ ok: z.literal(true), threadId: z.string() }),
   },
@@ -475,6 +496,8 @@ interface ProposalRecord {
   note: string;
   author: string;
   question_id: string | null;
+  research_id: string | null;
+  research_key: string | null;
   status: "pending" | "applied" | "rejected" | "superseded";
   resolution_note: string;
   resolved_by: string;
@@ -503,6 +526,12 @@ interface ResearchRecord {
   thread_id: string;
   status: "running" | "done" | "failed" | "cancelled";
   result_spec_id: string | null;
+  integration_state: Research["integrationState"];
+  integration_error: string;
+  integration_key: string | null;
+  synthesis_thread_id: string | null;
+  proposal_id: string | null;
+  incorporated_revision: number | null;
   error: string;
   created_at: string;
   updated_at: string;
@@ -744,6 +773,7 @@ export default async function plugin(bb: BbPluginApi) {
     config = next;
   });
 
+  let disposed = false;
   const db = bb.storage.database();
   bb.storage.migrate(db, [
     `CREATE TABLE IF NOT EXISTS specs (
@@ -895,6 +925,14 @@ export default async function plugin(bb: BbPluginApi) {
     `ALTER TABLE proposals ADD COLUMN icon TEXT`,
     `ALTER TABLE annotations ADD COLUMN requires_spec_change INTEGER NOT NULL DEFAULT 1`,
     `ALTER TABLE annotations ADD COLUMN change_requested INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE proposals ADD COLUMN research_id TEXT`,
+    `ALTER TABLE proposals ADD COLUMN research_key TEXT`,
+    `ALTER TABLE research ADD COLUMN integration_state TEXT NOT NULL DEFAULT 'pending'`,
+    `ALTER TABLE research ADD COLUMN integration_error TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE research ADD COLUMN integration_key TEXT`,
+    `ALTER TABLE research ADD COLUMN synthesis_thread_id TEXT`,
+    `ALTER TABLE research ADD COLUMN proposal_id TEXT`,
+    `ALTER TABLE research ADD COLUMN incorporated_revision INTEGER`,
   ]);
 
   // ---- project name cache (sync digest needs names without async sdk calls) --
@@ -987,6 +1025,7 @@ export default async function plugin(bb: BbPluginApi) {
       updatedAt: record.updated_at,
       projectIds: projectIdsFor(record.id),
       openAnnotations: openAnnotations.n,
+      parent: record.parent_spec_id === null ? null : (() => { const parent = findSpecById(record.parent_spec_id); return parent === undefined ? null : { id: parent.id, title: parent.title, slug: parent.slug }; })(),
     };
   }
 
@@ -1356,6 +1395,15 @@ export default async function plugin(bb: BbPluginApi) {
 
   function publishChanged(specId: string, reason: string): void {
     bb.realtime.publish(CHANGED, { specId, reason });
+    if (["updated", "question-asked", "question-answered", "question-resolved", "question-dismissed", "question-reopened", "question-clarified", "annotation-removed", "decision-recorded", "research-done", "proposal-created", "proposal-applied", "proposal-rejected"].includes(reason)) {
+      // Run after the surrounding transaction commits; applying a proposal also
+      // records its incorporation state in that transaction.
+      void Promise.resolve().then(async () => {
+        if (disposed) return;
+        const runs = db.prepare("SELECT * FROM research WHERE status = 'done' AND result_spec_id = ?").all(specId) as ResearchRecord[];
+        for (const run of runs) await prepareResearch(run.id);
+      }).catch((error) => { if (!disposed) bb.log.warn(`research integration: ${String(error)}`); });
+    }
   }
 
   // ---- spec mutations ------------------------------------------------------
@@ -1645,6 +1693,8 @@ export default async function plugin(bb: BbPluginApi) {
     const runningResearch = db
       .prepare("SELECT thread_id FROM research WHERE spec_id = ? AND status = 'running'")
       .all(spec.id) as Array<{ thread_id: string }>;
+    const preparingResearch = db.prepare("SELECT synthesis_thread_id AS thread_id FROM research WHERE (spec_id = ? OR result_spec_id = ?) AND integration_state = 'preparing' AND synthesis_thread_id IS NOT NULL").all(spec.id, spec.id) as Array<{ thread_id: string }>;
+    const sourceResearch = db.prepare("SELECT spec_id FROM research WHERE result_spec_id = ?").all(spec.id) as Array<{ spec_id: string }>;
     const remove = db.transaction(() => {
       for (const annotation of annotationIds) {
         db.prepare("DELETE FROM annotation_comments WHERE annotation_id = ?").run(
@@ -1660,8 +1710,9 @@ export default async function plugin(bb: BbPluginApi) {
       db.prepare("DELETE FROM decisions WHERE spec_id = ?").run(spec.id);
       db.prepare("DELETE FROM research WHERE spec_id = ?").run(spec.id);
       db.prepare("DELETE FROM spec_messages WHERE spec_id = ?").run(spec.id);
-      db.prepare("UPDATE research SET result_spec_id = NULL WHERE result_spec_id = ?").run(spec.id);
-      // Research reports are independent documents once created.
+      db.prepare("UPDATE proposals SET status = 'superseded', resolved_at = ?, resolution_note = 'Research report deleted' WHERE research_id IN (SELECT id FROM research WHERE result_spec_id = ?) AND status = 'pending'").run(nowIso(), spec.id);
+      db.prepare("UPDATE research SET result_spec_id = NULL, integration_state = 'failed', integration_error = 'The research report was deleted.', proposal_id = NULL WHERE result_spec_id = ?").run(spec.id);
+      // Preserve completed reports if their parent is deleted.
       db.prepare("UPDATE specs SET parent_spec_id = NULL WHERE parent_spec_id = ?").run(spec.id);
       db.prepare("DELETE FROM annotations WHERE spec_id = ?").run(spec.id);
       db.prepare("DELETE FROM spec_revisions WHERE spec_id = ?").run(spec.id);
@@ -1675,7 +1726,7 @@ export default async function plugin(bb: BbPluginApi) {
     textScanCache.delete(spec.id);
     // Remove records before awaiting cleanup: late completion must not publish
     // another report for a deleted spec.
-    const threadIds = new Set(runningResearch.map((record) => record.thread_id));
+    const threadIds = new Set([...runningResearch, ...preparingResearch].map((record) => record.thread_id));
     if (chat !== undefined) threadIds.add(chat.thread_id);
     for (const threadId of threadIds) {
       try {
@@ -1690,6 +1741,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
     }
     publishChanged(spec.id, "deleted");
+    for (const source of sourceResearch) publishChanged(source.spec_id, "research-report-deleted");
     return { archivedThreadId: chat?.thread_id ?? null };
   }
 
@@ -1906,6 +1958,7 @@ export default async function plugin(bb: BbPluginApi) {
       note: row.note,
       author: row.author,
       questionId: row.question_id,
+      researchId: row.research_id,
       status: row.status,
       resolutionNote: row.resolution_note,
       resolvedBy: row.resolved_by,
@@ -1934,6 +1987,8 @@ export default async function plugin(bb: BbPluginApi) {
     note?: string;
     author: string;
     questionId?: string;
+    researchId?: string;
+    researchKey?: string;
   }): ProposalRecord {
     const spec = findSpecById(input.specId);
     if (spec === undefined) throw new Error(`No spec with id ${input.specId}.`);
@@ -1941,6 +1996,14 @@ export default async function plugin(bb: BbPluginApi) {
       throw new RevisionConflictError(input.expectedRevision, spec);
     }
     if (input.questionId !== undefined) validateProposalQuestion(input.questionId, spec.id);
+    let sourceResearch: ResearchRecord | undefined;
+    if (input.researchId !== undefined) {
+      sourceResearch = researchById(input.researchId);
+      if (sourceResearch.spec_id !== spec.id || sourceResearch.integration_state !== "preparing" || input.researchKey !== sourceResearch.integration_key || researchSourceKey(sourceResearch) !== input.researchKey || researchHasQuestions(sourceResearch)) {
+        throw new Error("Research changed or belongs to another parent. Prepare a fresh parent update.");
+      }
+      if (input.expectedRevision === undefined || input.questionId !== undefined) throw new Error("Research updates require expectedRevision and cannot target a question.");
+    }
     const content = input.content ?? spec.content;
     assertContentSize(content);
     const record: ProposalRecord = {
@@ -1954,6 +2017,8 @@ export default async function plugin(bb: BbPluginApi) {
       note: input.note?.trim() ?? "",
       author: input.author,
       question_id: input.questionId ?? null,
+      research_id: input.researchId ?? null,
+      research_key: input.researchKey ?? null,
       status: "pending",
       resolution_note: "",
       resolved_by: "",
@@ -1981,6 +2046,11 @@ export default async function plugin(bb: BbPluginApi) {
       db.prepare("UPDATE proposals SET status = 'superseded', resolved_at = ?, resolution_note = 'Replaced by a newer proposal' WHERE question_id = ? AND id != ? AND status = 'pending'").run(nowIso(), input.questionId, record.id);
       db.prepare("UPDATE annotations SET change_requested = 0, requires_spec_change = 1 WHERE id = ?").run(input.questionId);
     }
+    if (sourceResearch !== undefined) {
+      db.prepare("UPDATE proposals SET research_id = ?, research_key = ? WHERE id = ?").run(sourceResearch.id, input.researchKey, record.id);
+      db.prepare("UPDATE research SET integration_state = 'review', proposal_id = ?, integration_error = '' WHERE id = ?").run(record.id, sourceResearch.id);
+      publishChanged(sourceResearch.result_spec_id!, "research-review");
+    }
     publishChanged(spec.id, "proposal-created");
     return record;
   }
@@ -1993,7 +2063,11 @@ export default async function plugin(bb: BbPluginApi) {
     return question;
   }
 
-  function applyProposal(
+  function applyProposal(proposalId: string, actor: string): { revision: number } {
+    return db.transaction(() => applyProposalTransaction(proposalId, actor))();
+  }
+
+  function applyProposalTransaction(
     proposalId: string,
     actor: string,
   ): { revision: number } {
@@ -2007,6 +2081,12 @@ export default async function plugin(bb: BbPluginApi) {
     }
     const spec = findSpecById(row.spec_id);
     if (spec === undefined) throw new Error(`No spec with id ${row.spec_id}.`);
+    if (row.research_id !== null) {
+      const research = researchById(row.research_id);
+      if (research.spec_id !== spec.id || research.proposal_id !== row.id || research.integration_key !== row.research_key || researchSourceKey(research) !== row.research_key || researchHasQuestions(research)) {
+        throw new Error("Research has changed. Prepare a fresh parent update before applying.");
+      }
+    }
     const question = row.question_id === null ? undefined : validateProposalQuestion(row.question_id, spec.id);
     if (spec.revision !== row.base_revision) {
       db.prepare(
@@ -2046,6 +2126,11 @@ export default async function plugin(bb: BbPluginApi) {
         updated.revision,
       );
     }
+    if (row.research_id !== null) {
+      db.prepare("UPDATE research SET integration_state = 'incorporated', incorporated_revision = ?, integration_error = '' WHERE id = ?").run(updated.revision, row.research_id);
+      const research = researchById(row.research_id);
+      if (research.result_spec_id !== null) publishChanged(research.result_spec_id, "research-incorporated");
+    }
     publishChanged(spec.id, "proposal-applied");
     return { revision: updated.revision };
   }
@@ -2066,6 +2151,11 @@ export default async function plugin(bb: BbPluginApi) {
     db.prepare(
       "UPDATE proposals SET status = 'rejected', resolution_note = ?, resolved_by = ?, resolved_at = ? WHERE id = ?",
     ).run(note, actor, nowIso(), proposalId);
+    if (row.research_id !== null) {
+      db.prepare("UPDATE research SET integration_state = 'rejected', integration_error = ? WHERE id = ?").run(note || "Parent update rejected. You can request a revised update.", row.research_id);
+      const research = researchById(row.research_id);
+      if (research.result_spec_id !== null) publishChanged(research.result_spec_id, "research-rejected");
+    }
     publishChanged(row.spec_id, "proposal-rejected");
   }
 
@@ -2202,7 +2292,116 @@ export default async function plugin(bb: BbPluginApi) {
 
   // ---- research briefs -----------------------------------------------------
 
+  function researchById(id: string): ResearchRecord {
+    const row = db.prepare("SELECT * FROM research WHERE id = ?").get(id) as ResearchRecord | undefined;
+    if (row === undefined) throw new Error(`No research run ${id}.`);
+    return row;
+  }
+
+  function researchHasQuestions(run: ResearchRecord): boolean {
+    if (run.result_spec_id === null) return true;
+    const report = findSpecById(run.result_spec_id);
+    if (report === undefined) return true;
+    return detectTextQuestions(report.content).length > 0 || annotationsFor(report.id).some((annotation) => annotation.kind === "question" && annotation.status === "open") || pendingProposalsFor(report.id).length > 0;
+  }
+
+  function researchSourceKey(run: ResearchRecord): string {
+    const report = run.result_spec_id === null ? undefined : findSpecById(run.result_spec_id);
+    if (report === undefined) return "missing";
+    const questions = annotationsFor(report.id).filter((annotation) => annotation.kind === "question").map(({ id, state, answer, decision }) => ({ id, state, answer, decision }));
+    return createHash("sha256").update(JSON.stringify({ revision: report.revision, questions, decisions: decisionsFor({ specId: report.id }), proposals: pendingProposalsFor(report.id).map((proposal) => proposal.id) })).digest("hex");
+  }
+
+  function finishResearchPreparation(threadId: string, error: string): void {
+    const runs = db.prepare("SELECT * FROM research WHERE synthesis_thread_id = ? AND integration_state = 'preparing'").all(threadId) as ResearchRecord[];
+    for (const run of runs) {
+      db.prepare("UPDATE research SET integration_state = 'failed', integration_error = ? WHERE id = ?").run(error, run.id);
+      publishChanged(run.spec_id, "research-integration-failed");
+      if (run.result_spec_id !== null) publishChanged(run.result_spec_id, "research-integration-failed");
+    }
+  }
+
+  const researchPreparations = new Map<string, Promise<void>>();
+  async function prepareResearch(id: string, force = false): Promise<void> {
+    const pending = researchPreparations.get(id);
+    if (pending !== undefined) return pending;
+    const task = prepareResearchUpdate(id, force);
+    researchPreparations.set(id, task);
+    try { await task; } finally {
+      researchPreparations.delete(id);
+      if (!disposed) {
+        const latest = db.prepare("SELECT * FROM research WHERE id = ?").get(id) as ResearchRecord | undefined;
+        if (latest !== undefined && latest.integration_key !== null && latest.result_spec_id !== null && findSpecById(latest.spec_id)?.status === "active" && findSpecById(latest.result_spec_id)?.status === "active" && latest.integration_key !== researchSourceKey(latest)) {
+          void prepareResearch(id).catch((error) => { if (!disposed) bb.log.warn(String(error)); });
+        }
+      }
+    }
+  }
+
+  async function prepareResearchUpdate(id: string, force: boolean): Promise<void> {
+    const run = researchById(id);
+    if (run.status !== "done" || run.result_spec_id === null) return;
+    const report = findSpecById(run.result_spec_id);
+    const parent = findSpecById(run.spec_id);
+    if (report === undefined || parent === undefined || parent.status === "archived" || report.status === "archived") return;
+    const key = researchSourceKey(run);
+    const blocked = researchHasQuestions(run);
+    if (!force && key === run.integration_key && (blocked ? run.integration_state === "waiting" : run.integration_state !== "waiting" && run.integration_state !== "pending")) return;
+    db.transaction(() => {
+      db.prepare("UPDATE proposals SET status = 'superseded', resolved_at = ?, resolution_note = 'Research updated; awaiting a fresh synthesis' WHERE research_id = ? AND status = 'pending'").run(nowIso(), id);
+      db.prepare("UPDATE research SET integration_state = ?, integration_key = ?, integration_error = '', proposal_id = NULL, synthesis_thread_id = NULL WHERE id = ?").run(blocked ? "waiting" : "preparing", key, id);
+    })();
+    publishChanged(parent.id, "research-integration");
+    publishChanged(report.id, "research-integration");
+    if (run.integration_state === "preparing" && run.synthesis_thread_id !== null) {
+      try {
+        await bb.sdk.threads.stop({ threadId: run.synthesis_thread_id });
+        await bb.sdk.threads.archive({ threadId: run.synthesis_thread_id });
+      } catch (error) { if (!disposed) bb.log.warn(`Previous research preparation cleanup failed: ${String(error)}`); }
+    }
+    if (disposed) return;
+    if (blocked) return;
+    const prompt = [
+      `Incorporate settled research into parent spec "${parent.title}" (${parent.id}).`,
+      `Research run: ${run.id}. Report: ${report.id}. Research key: ${key}.`,
+      `Read the parent and report with specs_read, and the report's decisions with specs_decisions.`,
+      "Synthesize the supported findings and accepted decisions into the relevant parent sections. Preserve unrelated requirements. Do not simply append the report, and do not treat speculation as an agreed requirement.",
+      `Submit one specs_propose targeting idOrSlug: "${parent.id}", expectedRevision from your parent read, researchId: "${run.id}", researchKey: "${key}". Include a concise note explaining the changes.`,
+      "Do not edit the parent directly, modify code, resolve questions, or apply the proposal. The user reviews the parent update. If the parent already incorporates the findings, submit the unchanged parent content with a note explaining that review can confirm incorporation.",
+    ].join("\n");
+    try {
+      const projectId = projectIdsFor(parent.id)[0] ?? await personalProjectId();
+      const thread = await bb.sdk.threads.spawn({
+        projectId,
+        environment: projectIdsFor(parent.id).length === 0 ? { type: "host", workspace: { type: "personal" } } : { type: "project-default" },
+        title: `Incorporate research: ${truncate(run.brief, 60)}`,
+        prompt,
+        pluginMetadata: { specId: parent.id, researchIntegrationId: id },
+      });
+      if (disposed) return;
+      const latest = db.prepare("SELECT * FROM research WHERE id = ?").get(id) as ResearchRecord | undefined;
+      if (latest === undefined || findSpecById(parent.id) === undefined || findSpecById(report.id) === undefined) {
+        await discardThreadForDeletedSpec(parent.id, thread.id);
+      }
+      if (latest?.integration_key === key && latest.integration_state === "preparing") {
+        db.prepare("UPDATE research SET synthesis_thread_id = ? WHERE id = ?").run(thread.id, id);
+        for (const specId of [parent.id, report.id]) db.prepare("INSERT OR REPLACE INTO thread_specs (thread_id, spec_id, mode, created_at) VALUES (?, ?, 'attached', ?)").run(thread.id, specId, nowIso());
+        await reconcileResearchPreparation(researchById(id));
+      } else {
+        await bb.sdk.threads.stop({ threadId: thread.id });
+        await bb.sdk.threads.archive({ threadId: thread.id });
+      }
+    } catch (error) {
+      if (disposed) return;
+      db.prepare("UPDATE research SET integration_state = 'failed', integration_error = ? WHERE id = ? AND integration_key = ? AND integration_state = 'preparing'").run(String(error), id, key);
+      publishChanged(parent.id, "research-integration-failed");
+      publishChanged(report.id, "research-integration-failed");
+    }
+  }
+
   function researchFrom(row: ResearchRecord): Research {
+    const proposal = row.proposal_id === null ? undefined : db.prepare("SELECT base_revision FROM proposals WHERE id = ?").get(row.proposal_id) as { base_revision: number } | undefined;
+    const stale = row.integration_state === "review" && proposal?.base_revision !== findSpecById(row.spec_id)?.revision;
     return {
       id: row.id,
       specId: row.spec_id,
@@ -2210,6 +2409,10 @@ export default async function plugin(bb: BbPluginApi) {
       threadId: row.thread_id,
       status: row.status,
       resultSpecId: row.result_spec_id,
+      integrationState: stale ? "failed" : row.integration_state,
+      integrationError: stale ? "The parent changed after this update was prepared. Prepare an updated proposal." : row.integration_error,
+      proposalId: row.proposal_id,
+      incorporatedRevision: row.incorporated_revision,
       error: row.error,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -2219,13 +2422,13 @@ export default async function plugin(bb: BbPluginApi) {
   function researchFor(specId: string): Research[] {
     const rows = db
       .prepare(
-        "SELECT * FROM research WHERE spec_id = ? ORDER BY created_at DESC LIMIT 10",
+        "SELECT * FROM research WHERE spec_id = ? ORDER BY created_at DESC",
       )
       .all(specId) as ResearchRecord[];
     return rows.map(researchFrom);
   }
 
-  // ---- spec discussion (context, never a trigger) --------------------------
+  // ---- spec discussion ----------------------------------------------------
 
   function specMessagesFor(specId: string, limit = 50): SpecMessage[] {
     const rows = db
@@ -2479,6 +2682,8 @@ export default async function plugin(bb: BbPluginApi) {
       thread_id: thread.id,
       status: "running",
       result_spec_id: null,
+      integration_state: "pending", integration_error: "", integration_key: null,
+      synthesis_thread_id: null, proposal_id: null, incorporated_revision: null,
       error: "",
       created_at: timestamp,
       updated_at: timestamp,
@@ -2522,7 +2727,11 @@ export default async function plugin(bb: BbPluginApi) {
       ).run(status, resultSpecId, error, nowIso(), record.id);
       return true;
     });
-    if (finalize()) publishChanged(record.spec_id, `research-${status}`);
+    if (finalize()) {
+      publishChanged(record.spec_id, `research-${status}`);
+      const result = researchById(record.id).result_spec_id;
+      if (status === "done" && result !== null) publishChanged(result, "research-done");
+    }
   }
 
   function runningResearchForThread(threadId: string): ResearchRecord | undefined {
@@ -2550,7 +2759,25 @@ export default async function plugin(bb: BbPluginApi) {
     finalizeResearch(record, "done", text, "");
   }
 
+  async function reconcileResearchPreparation(record: ResearchRecord): Promise<void> {
+    if (record.synthesis_thread_id === null) {
+      if (!researchPreparations.has(record.id)) {
+        db.prepare("UPDATE research SET integration_state = 'failed', integration_error = 'Preparation was interrupted. Try again.' WHERE id = ? AND integration_state = 'preparing'").run(record.id);
+      }
+      return;
+    }
+    const thread = await bb.sdk.threads.get({ threadId: record.synthesis_thread_id });
+    if (thread === null || thread === undefined || thread.deletedAt !== null || thread.archivedAt !== null || thread.status === "error" || thread.status === "idle") {
+      finishResearchPreparation(record.synthesis_thread_id, "Preparation ended without a parent update. Try again.");
+    }
+  }
+
   async function reconcileResearch(specId: string): Promise<void> {
+    const preparing = db.prepare("SELECT * FROM research WHERE (spec_id = ? OR result_spec_id = ?) AND integration_state = 'preparing'").all(specId, specId) as ResearchRecord[];
+    for (const record of preparing) {
+      try { await reconcileResearchPreparation(record); }
+      catch (error) { bb.log.warn(`research preparation reconcile failed: ${String(error)}`); }
+    }
     const running = db
       .prepare("SELECT * FROM research WHERE spec_id = ? AND status = 'running'")
       .all(specId) as ResearchRecord[];
@@ -2869,6 +3096,10 @@ export default async function plugin(bb: BbPluginApi) {
       `id: ${spec.id} · slug: ${spec.slug} · revision: ${spec.revision} · updated: ${spec.updated_at} · status: ${spec.status}`,
     ];
     if (spec.summary !== "") parts.push(`summary: ${spec.summary}`);
+    if (spec.parent_spec_id !== null) {
+      const parent = findSpecById(spec.parent_spec_id);
+      if (parent !== undefined) parts.push(`Research for: ${parent.title} (${parent.id}). Settle the report's questions here; a parent update is prepared automatically for user review.`);
+    }
     const projectIds = projectIdsFor(spec.id);
     if (projectIds.length > 0) parts.push(`linked projects: ${projectIds.join(", ")}`);
     if (includeAnnotations) {
@@ -2943,7 +3174,7 @@ export default async function plugin(bb: BbPluginApi) {
         parts.push("", "## Research runs");
         for (const run of runs.slice(0, 5)) {
           parts.push(
-            `- ${run.id} [${run.status}] ${truncate(run.brief, 160)}${run.resultSpecId === null ? ` · thread ${run.threadId}` : ` · published as ${run.resultSpecId}`}`,
+            `- ${run.id} [${run.status === "done" ? run.integrationState : run.status}] ${truncate(run.brief, 160)}${run.resultSpecId === null ? ` · thread ${run.threadId}` : ` · published as ${run.resultSpecId}`}`,
           );
         }
       }
@@ -3095,8 +3326,10 @@ export default async function plugin(bb: BbPluginApi) {
       icon: z.string().max(16).optional(),
       expectedRevision: z.number().int().optional(),
       questionId: z.string().optional(),
+      researchId: z.string().optional().describe("Research run being incorporated into its parent."),
+      researchKey: z.string().optional().describe("Source fingerprint from the research incorporation task."),
     }),
-    execute: ({ idOrSlug, content, title, summary, icon, note, expectedRevision, questionId }) => {
+    execute: ({ idOrSlug, content, title, summary, icon, note, expectedRevision, questionId, researchId, researchKey }) => {
       try {
         const spec = mustFindSpec(idOrSlug);
         const proposal = createProposal({
@@ -3104,6 +3337,7 @@ export default async function plugin(bb: BbPluginApi) {
           content,
           icon,
           expectedRevision,
+          researchId, researchKey,
           ...(title === undefined ? {} : { title }),
           ...(summary === undefined ? {} : { summary }),
           ...(note === undefined ? {} : { note }),
@@ -3614,11 +3848,13 @@ export default async function plugin(bb: BbPluginApi) {
   // Research runs finish on their own thread's lifecycle; the plugin turns a
   // completed run into a child spec. specs_get also reconciles stale rows.
   bb.events.on("thread.idle", ({ thread }) => {
+    finishResearchPreparation(thread.id, "The agent finished without preparing a parent update. Try again.");
     void completeResearchFromThread(thread.id, null).catch((error: unknown) => {
       bb.log.warn(`research completion failed: ${String(error)}`);
     });
   });
   bb.events.on("thread.failed", ({ thread, error }) => {
+    finishResearchPreparation(thread.id, error || "Preparing the parent update failed.");
     void completeResearchFromThread(
       thread.id,
       error === null || error === "" ? "The run failed." : error,
@@ -3628,6 +3864,7 @@ export default async function plugin(bb: BbPluginApi) {
   });
   for (const event of ["thread.archived", "thread.deleted"] as const) {
     bb.events.on(event, ({ thread }) => {
+      finishResearchPreparation(thread.id, "The parent-update thread was closed. Try again.");
       const record = runningResearchForThread(thread.id);
       if (record !== undefined) {
         finalizeResearch(
@@ -3750,6 +3987,7 @@ export default async function plugin(bb: BbPluginApi) {
         proposals: pendingProposalsFor(spec.id),
         decisions: decisionsFor({ specId: spec.id, limit: 100 }),
         research: researchFor(spec.id),
+        sourceResearch: (() => { const run = db.prepare("SELECT * FROM research WHERE result_spec_id = ?").get(spec.id) as ResearchRecord | undefined; return run === undefined ? null : researchFrom(run); })(),
         discussion: specMessagesFor(spec.id, 50),
         agentChange,
       };
@@ -3924,6 +4162,8 @@ export default async function plugin(bb: BbPluginApi) {
       return revertToRevision(id, toRevision, "user");
     },
 
+    research_prepare: async ({ researchId }) => { await prepareResearch(researchId, true); return { ok: true as const }; },
+
     research_start: async ({ specId, brief }) => {
       const spec = findSpecById(specId);
       if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
@@ -3940,6 +4180,25 @@ export default async function plugin(bb: BbPluginApi) {
       const spec = findSpecById(specId);
       if (spec === undefined) throw new Error(`No spec with id ${specId}.`);
       const result = await askAgentInChat(spec, text, "user");
+      return { ok: true as const, ...result };
+    },
+
+    chat_draft: async ({ specId, text, expectedRevision, insertionOffset }) => {
+      const spec = mustFindSpec(specId);
+      if (spec.revision !== expectedRevision) throw new RevisionConflictError(expectedRevision, spec);
+      if (insertionOffset > spec.content.length) throw new Error("The insertion point is outside this document. Choose the position again.");
+      const marker = `[[INSERT_${randomUUID()}]]`;
+      const request = [
+        `Draft an insertion in spec ${spec.id} at revision ${expectedRevision}.`,
+        `User request: ${text}`,
+        `The marker ${marker} below identifies the exact insertion point. It is context only, not saved content.`,
+        "Read the spec first. If its revision has changed, ask the user to select the insertion point again; do not guess a new position.",
+        `Use specs_propose with idOrSlug: "${spec.id}" and expectedRevision: ${expectedRevision}, containing the full document with the requested draft inserted at the marker. Preserve all existing text and remove the marker. Use fenced Markdown for code or Mermaid when requested.`,
+        "Always leave this as a proposal for the user to review, even if direct writes are configured. Do not use specs_write or apply the proposal.",
+        "Document with insertion point:",
+        spec.content.slice(0, insertionOffset) + marker + spec.content.slice(insertionOffset),
+      ].join("\n\n");
+      const result = await askAgentInChat(spec, request, "user");
       return { ok: true as const, ...result };
     },
 
@@ -4893,6 +5152,7 @@ export default async function plugin(bb: BbPluginApi) {
   bb.background.schedule("refresh-projects", "*/10 * * * *", refreshProjectNames);
 
   bb.onDispose(() => {
+    disposed = true;
     bb.log.info("specs plugin disposed");
   });
 }

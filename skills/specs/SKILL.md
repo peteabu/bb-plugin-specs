@@ -108,11 +108,26 @@ are labelled "not audited".
   `specs_decisions` lists them. Check `specs_decisions` before re-litigating.
 - **Research runs are durable.** `specs_research` starts a read-only
   investigation; when it finishes the report is published as a child spec with
-  its own chat, questions, and decisions.
-- **Chat is context; `@agent` acts.** Messages posted to the spec discussion are
-  context for the next agent turn and do not start one. When a question is
-  dispatched or someone addresses the agent, reply in the thread with
-  `specs_reply` and record `specs_answer`/`specs_clarify`.
+  its own chat, questions, and decisions, nested beneath the parent in the UI.
+  Once all report questions and proposals are settled, a synthesis thread
+  prepares a parent proposal automatically. In that thread, use `specs_propose`
+  with the supplied `researchId`, `researchKey`, and the parent revision you
+  read as `expectedRevision`. Never apply the update yourself. User acceptance
+  records the incorporated parent revision; changed findings invalidate old
+  updates. Historical reports start preparation on a later change or explicit
+  user request, not merely because the plugin was installed.
+- **Chat has one Send action.** Each message asks the spec's agent to reply.
+  No mention syntax is required. When a question is dispatched, reply with
+  `specs_reply` and record a settled answer with `specs_answer`.
+- **Inline drafting has an explicit insertion point.** Requests from the editor
+  include the saved revision and a temporary marker in a document snapshot.
+  Propose the full document with the requested content at that position;
+  preserve existing text and exclude the marker. Use `specs_propose` even
+  when direct writes are configured. If the revision changed, ask the user
+  to choose the position again instead of guessing.
+- **Diagrams are document content.** Use standalone fenced `mermaid` blocks.
+  For diagram iterations, preserve surrounding prose and propose the full
+  revised document against the revision you read.
 - Agent-made revisions show a review banner in the UI with Keep / Revert, so a
   direct write (or an applied proposal) is never silently accepted.
 

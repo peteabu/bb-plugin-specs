@@ -82,7 +82,7 @@ async function setup() {
   const reports = (specId: string) =>
     bb.storage.database().prepare("SELECT * FROM specs WHERE parent_spec_id = ?").all(specId);
   return {
-    harness, rpc, create, detail, start, rows, reports, threads,
+    harness, rpc, create, detail, start, rows, reports, threads, db: bb.storage.database(),
     spawn, output, send, stop, archive,
     holdSpawn: (gate: Promise<void>) => { spawnGate = gate; },
     holdOutput: (gate: Promise<string>) => { outputGate = gate; },
@@ -284,5 +284,163 @@ describe("preparing a missing proposal", () => {
     expect(current.spec.revision).toBe(1);
     expect(current.decisions).toEqual([]);
     expect(JSON.stringify(host.harness.inspection.sdk.calls)).toContain("The user accepts the answer");
+  });
+});
+
+describe("research incorporation", () => {
+  async function completed(report = "## Findings\nUse the simpler design.") {
+    const host = await setup();
+    const parent = await host.create();
+    host.holdOutput(Promise.resolve(report));
+    const run = await host.start(parent.id);
+    host.threads.get(run.threadId)!.status = "idle";
+    await host.detail(parent.id);
+    await vi.waitFor(() => expect(host.reports(parent.id)).toHaveLength(1));
+    const child = (await host.detail(parent.id)).research[0]!.resultSpecId!;
+    return { host, parent, run, child };
+  }
+  async function propose(context: Awaited<ReturnType<typeof completed>>, content = "Settled parent requirements") {
+    const { host, parent, run } = context;
+    await vi.waitFor(() => expect(host.rows("research", parent.id)[0]).toMatchObject({ integration_state: "preparing", synthesis_thread_id: expect.any(String) }));
+    const record = host.rows("research", parent.id)[0] as { integration_key: string; synthesis_thread_id: string };
+    return host.harness.behavior.callAgentTool("specs_propose", {
+      idOrSlug: parent.id, content, expectedRevision: (await host.detail(parent.id)).spec.revision,
+      researchId: run.researchId, researchKey: record.integration_key,
+    }, { threadId: record.synthesis_thread_id, projectId: "project-1" });
+  }
+
+  it("prepares one parent proposal and records the exact incorporated revision only on apply", async () => {
+    const context = await completed();
+    const { host, parent, child, run } = context;
+    expect((await host.detail(child)).spec.parent).toMatchObject({ id: parent.id, title: "Parent spec" });
+    expect(await propose(context)).not.toMatchObject({ isError: true });
+    const review = await host.detail(parent.id);
+    expect(review.spec.content).toBe("Initial content");
+    expect(review.research[0]).toMatchObject({ integrationState: "review", incorporatedRevision: null });
+    expect(review.proposals[0]).toMatchObject({ researchId: run.researchId, specId: parent.id });
+    await host.rpc("proposals_apply", { proposalId: review.proposals[0]!.id });
+    expect((await host.detail(parent.id)).spec).toMatchObject({ content: "Settled parent requirements", revision: 2 });
+    expect((await host.detail(child)).sourceResearch).toMatchObject({ integrationState: "incorporated", incorporatedRevision: 2 });
+    await host.harness.behavior.emitThreadEvent("thread.idle", { thread: host.threads.get(run.threadId)!, lastAssistantText: "Done" });
+    expect(host.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for prose questions and reviewed answers before preparing a parent update", async () => {
+    const { host, parent, child } = await completed("## Open questions\n- Should we cache?\n");
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("waiting");
+    expect(host.spawn).toHaveBeenCalledTimes(1);
+    const question = await host.rpc<{ id: string }>("annotations_create", { specId: child, kind: "question", quote: "Should we cache?", body: "Should we cache?" });
+    await host.rpc("specs_save", { id: child, content: "## Findings\nCaching is optional.", expectedRevision: 1 });
+    await host.rpc("questions_answer", { annotationId: question.id, answer: "No caching", requiresSpecChange: false });
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("waiting");
+    const annotation = (await host.detail(child)).annotations[0]!;
+    await host.rpc("questions_accept", { annotationId: annotation.id, expectedAnswer: annotation.answer, expectedUpdatedAt: annotation.updatedAt });
+    await vi.waitFor(() => expect(host.spawn).toHaveBeenCalledTimes(2));
+    expect((await host.detail(parent.id)).research[0]?.integrationState).toBe("preparing");
+  });
+
+  it("invalidates prepared updates when report questions reopen and rejects stale worker output", async () => {
+    const context = await completed();
+    const { host, parent, child, run } = context;
+    await propose(context);
+    const proposal = (await host.detail(parent.id)).proposals[0]!;
+    const oldKey = (host.rows("research", parent.id)[0] as { integration_key: string }).integration_key;
+    await host.rpc("annotations_create", { specId: child, kind: "question", quote: "simpler", body: "What about concurrency?" });
+    await expect(host.rpc("proposals_apply", { proposalId: proposal.id })).rejects.toThrow();
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("waiting");
+    const stale = await host.harness.behavior.callAgentTool("specs_propose", { idOrSlug: parent.id, content: "Stale", expectedRevision: 1, researchId: run.researchId, researchKey: oldKey });
+    expect(stale).toMatchObject({ isError: true });
+    expect((await host.detail(parent.id)).spec.content).toBe("Initial content");
+  });
+
+  it("offers a retry after the parent changes or review rejects an update", async () => {
+    const context = await completed();
+    const { host, parent, child, run } = context;
+    await propose(context);
+    await host.rpc("specs_save", { id: parent.id, content: "New user requirement", expectedRevision: 1 });
+    expect((await host.detail(child)).sourceResearch).toMatchObject({ integrationState: "failed", integrationError: expect.stringContaining("parent changed") });
+    await host.rpc("research_prepare", { researchId: run.researchId });
+    await propose(context, "New user requirement plus findings");
+    const proposal = (await host.detail(parent.id)).proposals[0]!;
+    await host.rpc("proposals_reject", { proposalId: proposal.id, note: "Needs better evidence" });
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("rejected");
+    expect(host.spawn).toHaveBeenCalledTimes(3);
+    await host.rpc("research_prepare", { researchId: run.researchId });
+    expect(host.spawn).toHaveBeenCalledTimes(4);
+  });
+
+  it("reconciles a stopped synthesis on report read without silently restarting it", async () => {
+    const { host, parent, child, run } = await completed();
+    await vi.waitFor(() => expect(host.spawn).toHaveBeenCalledTimes(2));
+    const record = host.rows("research", parent.id)[0] as { synthesis_thread_id: string };
+    host.threads.get(record.synthesis_thread_id)!.status = "idle";
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("failed");
+    expect(host.spawn).toHaveBeenCalledTimes(2);
+    await host.rpc("research_prepare", { researchId: run.researchId });
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("preparing");
+  });
+
+  it("leaves historical reports pending when read or when a sibling research run completes", async () => {
+    const { host, parent, child, run } = await completed();
+    await vi.waitFor(() => expect(host.spawn).toHaveBeenCalledTimes(2));
+    host.db.prepare("UPDATE research SET integration_state = 'pending', integration_key = NULL, synthesis_thread_id = NULL WHERE id = ?").run(run.researchId);
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("pending");
+    const next = await host.start(parent.id);
+    host.threads.get(next.threadId)!.status = "idle";
+    await host.detail(parent.id);
+    await vi.waitFor(() => expect(host.spawn).toHaveBeenCalledTimes(4));
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("pending");
+  });
+
+  it("picks up changed findings after an in-flight preparation spawn finishes", async () => {
+    const { host, parent, child, run } = await completed("## Open questions\n- Cache?\n");
+    const gate = deferred<void>();
+    host.holdSpawn(gate.promise);
+    await host.rpc("specs_save", { id: child, content: "First findings", expectedRevision: 1 });
+    await vi.waitFor(() => expect(host.spawn).toHaveBeenCalledTimes(2));
+    await host.rpc("specs_save", { id: child, content: "Revised findings", expectedRevision: 2 });
+    host.holdSpawn(Promise.resolve());
+    gate.resolve();
+    await vi.waitFor(() => expect(host.spawn).toHaveBeenCalledTimes(3));
+    expect(host.stop).toHaveBeenCalledWith({ threadId: "research-thread-2" });
+    expect((await host.detail(child)).sourceResearch?.integrationState).toBe("preparing");
+    expect((await host.detail(parent.id)).research.find((item) => item.id === run.researchId)?.proposalId).toBeNull();
+  });
+
+  it("supersedes a parent update when its report is deleted", async () => {
+    const context = await completed();
+    const { host, parent, child } = context;
+    await propose(context);
+    await host.rpc("specs_delete", { id: child });
+    const detail = await host.detail(parent.id);
+    expect(detail.proposals).toEqual([]);
+    expect(detail.research[0]).toMatchObject({ resultSpecId: null, integrationState: "failed" });
+  });
+});
+
+describe("inline draft dispatch", () => {
+  it("anchors the requested insertion to a revision and reuses the spec conversation", async () => {
+    const host = await setup();
+    const spec = await host.create();
+    await host.rpc("chat_draft", { specId: spec.id, text: "Add a diagram", expectedRevision: 1, insertionOffset: 7 });
+    const prompt = (host.spawn.mock.calls[0]![0] as unknown as { prompt: string }).prompt;
+    expect(prompt).toMatch(/Initial\[\[INSERT_[^\]]+\]\] content/);
+    expect(prompt).toContain('expectedRevision: 1');
+    expect(prompt).toContain(`idOrSlug: "${spec.id}"`);
+    expect(prompt).toContain("Do not use specs_write or apply the proposal");
+    expect((await host.detail(spec.id)).spec).toMatchObject({ content: "Initial content", revision: 1 });
+    await host.rpc("chat_draft", { specId: spec.id, text: "Add an example", expectedRevision: 1, insertionOffset: 15 });
+    expect(host.spawn).toHaveBeenCalledTimes(1);
+    expect(host.send).toHaveBeenCalledOnce();
+  });
+
+  it("rejects outdated revisions and invalid positions before invoking an agent", async () => {
+    const host = await setup();
+    const spec = await host.create();
+    await host.rpc("specs_save", { id: spec.id, content: "Updated", expectedRevision: 1 });
+    await expect(host.rpc("chat_draft", { specId: spec.id, text: "Add a diagram", expectedRevision: 1, insertionOffset: 0 })).rejects.toThrow(/Revision conflict/);
+    await expect(host.rpc("chat_draft", { specId: spec.id, text: "Add a diagram", expectedRevision: 2, insertionOffset: 100 })).rejects.toThrow(/outside/);
+    expect(host.spawn).not.toHaveBeenCalled();
+    expect(host.send).not.toHaveBeenCalled();
   });
 });

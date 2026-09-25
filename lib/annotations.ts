@@ -9,7 +9,7 @@ function collectTextNodes(container: HTMLElement): Text[] {
   const nodes: Text[] = [];
   let node = walker.nextNode();
   while (node !== null) {
-    nodes.push(node as Text);
+    if (!(node.parentElement?.closest('[contenteditable="false"]'))) nodes.push(node as Text);
     node = walker.nextNode();
   }
   return nodes;

@@ -54,7 +54,7 @@ import {
 } from "@/components/ui/markdown-editor";
 import { cn } from "@/lib/utils";
 import { useSpecDraft } from "@/hooks/use-spec-draft";
-import { captureSelection, findAnnotationRange, type QuoteLocation } from "./lib/annotations";
+import { findAnnotationRange, type QuoteLocation } from "./lib/annotations";
 import "./app.css";
 
 // ---------------------------------------------------------------------------
@@ -112,31 +112,6 @@ interface AnnotationDraft extends SelectionMenu {
   kind: "note" | "question";
 }
 
-function applyDomHighlights(container: HTMLElement, ranges: Range[]): () => void {
-  const marks: HTMLElement[] = [];
-  for (const range of ranges) {
-    try {
-      const mark = document.createElement("mark");
-      mark.className = "specs-annotation-mark";
-      range.surroundContents(mark);
-      marks.push(mark);
-    } catch {
-      // Range crosses element boundaries; the comment rail still shows it.
-    }
-  }
-  return () => {
-    for (const mark of marks) {
-      const parent = mark.parentNode;
-      if (parent === null) continue;
-      while (mark.firstChild !== null) {
-        parent.insertBefore(mark.firstChild, mark);
-      }
-      parent.removeChild(mark);
-    }
-    container.normalize();
-  };
-}
-
 function useAnnotationHighlights(
   containerRef: RefObject<HTMLDivElement | null>,
   annotations: Annotation[],
@@ -152,7 +127,7 @@ function useAnnotationHighlights(
       if (range !== null) ranges.push(range);
     }
     if (ranges.length === 0) return;
-    const css = CSS as unknown as { highlights?: Map<string, unknown> };
+    const css = globalThis.CSS as unknown as { highlights?: Map<string, unknown> };
     const HighlightCtor = (
       globalThis as unknown as { Highlight?: new (...ranges: Range[]) => unknown }
     ).Highlight;
@@ -167,7 +142,7 @@ function useAnnotationHighlights(
         }
       };
     }
-    return applyDomHighlights(container, ranges);
+    // Lexical owns this DOM; do not wrap editable text in fallback marks.
   }, [containerRef, annotations, revisionKey]);
 }
 
@@ -253,6 +228,20 @@ interface SpecGroup {
   specs: SpecSummary[];
 }
 
+function orderSpecTree(specs: SpecSummary[]): SpecSummary[] {
+  const ids = new Set(specs.map((spec) => spec.id));
+  const result: SpecSummary[] = [];
+  const seen = new Set<string>();
+  const visit = (spec: SpecSummary) => {
+    if (seen.has(spec.id)) return;
+    seen.add(spec.id);
+    result.push(spec);
+    for (const child of specs) if (child.parent?.id === spec.id) visit(child);
+  };
+  for (const spec of specs) if (spec.parent === null || !ids.has(spec.parent.id)) visit(spec);
+  return result;
+}
+
 function groupSpecsByProject(
   specs: SpecSummary[],
   projectNames: Map<string, string>,
@@ -298,9 +287,9 @@ function SpecsSidebar({
 
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    return (specs ?? []).filter((spec) => {
+    return orderSpecTree(specs ?? []).filter((spec) => {
       if (needle === "") return true;
-      return `${spec.title} ${spec.slug} ${spec.summary}`
+      return `${spec.title} ${spec.slug} ${spec.summary} ${spec.parent?.title ?? ""}`
         .toLowerCase()
         .includes(needle);
     });
@@ -416,6 +405,7 @@ function SpecsSidebar({
                           onClick={() => onSelect(spec.slug)}
                           className={cn(
                             "specs-row group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left",
+                            spec.parent !== null && "ml-4 !w-[calc(100%-1rem)] border-l border-border",
                             selected
                               ? "bg-state-active text-foreground"
                               : "text-foreground/90 hover:bg-state-hover",
@@ -426,6 +416,7 @@ function SpecsSidebar({
                           </span>
                           <span className="min-w-0 flex-1 truncate text-[13px]">
                             {spec.title}
+                            {spec.parent === null ? null : <span className="block truncate text-[10px] text-muted-foreground">Research for {spec.parent.title}</span>}
                           </span>
                           <span
                             className={cn(
@@ -680,8 +671,10 @@ function DiffDialog({
   target,
   onOpenChange,
   onApplied,
+  beforeApply,
 }: {
-  onApplied: () => void;
+  onApplied: (outcome?: string) => void;
+  beforeApply: () => Promise<void>;
   target: DiffTarget | null;
   onOpenChange: (open: boolean) => void;
 }) {
@@ -755,16 +748,28 @@ function DiffDialog({
         {applyError === null ? null : <p role="alert" className="text-sm text-destructive">{applyError}</p>}
         <DialogFooter>
           <Button variant="ghost" disabled={applying} onClick={() => onOpenChange(false)}>Close</Button>
-          {target?.proposal && target.annotation ? <Button disabled={applying || rows === null || error !== null} onClick={async () => {
+          {target?.proposal?.researchId ? <Button variant="outline" disabled={applying} onClick={async () => {
             setApplying(true);
             setApplyError(null);
             try {
-              await rpc.call("questions_apply", { annotationId: target.annotation!.id, proposalId: target.proposal!.id, expectedAnswer: target.annotation!.answer, expectedUpdatedAt: target.annotation!.updatedAt });
+              await rpc.call("proposals_reject", { proposalId: target.proposal!.id, note: "Parent update rejected during review." });
+              onApplied("Update rejected");
+              onOpenChange(false);
+            } catch (cause) { setApplyError(messageOf(cause)); }
+            finally { setApplying(false); }
+          }}>Reject update</Button> : null}
+          {target?.proposal ? <Button disabled={applying || rows === null || error !== null} onClick={async () => {
+            setApplying(true);
+            setApplyError(null);
+            try {
+              await beforeApply();
+              if (target.annotation !== undefined) await rpc.call("questions_apply", { annotationId: target.annotation.id, proposalId: target.proposal!.id, expectedAnswer: target.annotation.answer, expectedUpdatedAt: target.annotation.updatedAt });
+              else await rpc.call("proposals_apply", { proposalId: target.proposal!.id });
               onApplied();
               onOpenChange(false);
             } catch (cause) { setApplyError(messageOf(cause)); }
             finally { setApplying(false); }
-          }}>{applying ? "Applying…" : "Apply and close"}</Button> : null}
+          }}>{applying ? "Applying…" : target.annotation !== undefined ? "Apply and close" : target.proposal.researchId !== null ? "Apply to parent" : "Apply change"}</Button> : null}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -938,43 +943,39 @@ function ProposalCard({
   );
 }
 
-function ResearchCard({
-  run,
-  onOpenRun,
-  onOpenResult,
-}: {
+function ResearchCard({ run, onOpenRun, onOpenResult, onReview, onPrepare, onViewRevision, reportOpen = false }: {
   run: Research;
+  reportOpen?: boolean;
   onOpenRun: () => void;
   onOpenResult: () => void;
+  onReview: () => void;
+  onPrepare: () => Promise<void>;
+  onViewRevision: () => void;
 }) {
-  return (
-    <div className="specs-hairline mb-3 flex flex-wrap items-center gap-2 rounded-xl bg-card px-3 py-2.5">
-      {run.status === "running" ? (
-        <Icon name="Loading" className="size-3.5 animate-spin text-primary" />
-      ) : (
-        <Icon name="Beaker" className="size-3.5 text-muted-foreground" />
-      )}
-      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground tabular-nums">
-        Research · {run.status}
-      </span>
-      <span className="min-w-0 flex-1 truncate text-sm">{run.brief}</span>
-      {run.status === "running" ? (
-        <Button size="sm" variant="outline" className="h-7 px-2.5" onClick={onOpenRun}>
-          Open run
-        </Button>
-      ) : null}
-      {run.status === "failed" ? (
-        <span className="text-[11px] text-destructive">
-          {truncate(run.error, 120)}
-        </span>
-      ) : null}
-      {run.resultSpecId === null ? null : (
-        <Button size="sm" className="h-7 px-2.5" onClick={onOpenResult}>
-          Open result
-        </Button>
-      )}
+  const [busy, setBusy] = useState(false);
+  const state = run.status !== "done" ? run.status : run.integrationState;
+  const labels: Record<string, string> = {
+    running: "Researching", failed: "Needs attention", cancelled: "Cancelled",
+    pending: "Findings ready", waiting: "Questions or report changes to settle",
+    preparing: "Preparing parent update", review: "Parent update ready for review",
+    incorporated: `Incorporated into parent · v${run.incorporatedRevision}`,
+    rejected: "Parent update rejected",
+  };
+  return <div className="mb-3 border-b border-border py-3">
+    <div className="flex items-center gap-2">
+      <Icon name={state === "running" || state === "preparing" ? "Loading" : "Beaker"} className={cn("size-3.5 shrink-0", (state === "running" || state === "preparing") && "animate-spin")} />
+      <span className="text-xs font-medium">{labels[state]}</span>
     </div>
-  );
+    <p className="mt-1 text-sm">{run.brief}</p>
+    {run.integrationError || run.error ? <p className="mt-1 text-xs text-destructive">{run.integrationError || run.error}</p> : null}
+    <div className="mt-2 flex flex-wrap gap-2">
+      {state === "review" ? <Button size="sm" onClick={onReview}>Review parent update</Button> : null}
+      {run.resultSpecId !== null && ["pending", "failed", "rejected"].includes(state) ? <Button size="sm" disabled={busy} onClick={async () => { setBusy(true); try { await onPrepare(); } finally { setBusy(false); } }}>{busy ? "Preparing…" : "Prepare parent update"}</Button> : null}
+      {state === "incorporated" ? <Button size="sm" variant="outline" onClick={onViewRevision}>View v{run.incorporatedRevision}</Button> : null}
+      {run.resultSpecId !== null ? <Button size="sm" variant="ghost" onClick={onOpenResult}>{reportOpen ? "Discuss findings" : "Open report"}</Button> : null}
+      {run.status === "running" ? <Button size="sm" variant="ghost" onClick={onOpenRun}>Open run</Button> : null}
+    </div>
+  </div>;
 }
 
 function EmojiPickerDialog({
@@ -1432,7 +1433,6 @@ export function SpecsWorkspace({
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBusy, setDeleteBusy] = useState(false);
-  const [selectionMenu, setSelectionMenu] = useState<SelectionMenu | null>(null);
   const [annotationDraft, setAnnotationDraft] = useState<AnnotationDraft | null>(
     null,
   );
@@ -1512,6 +1512,7 @@ export function SpecsWorkspace({
 
   useEffect(() => {
     ++detailRequestRef.current;
+    setChatText("");
     if (loadedDetail?.spec.id !== selectedSlug) {
       setDetail(null);
       detailRef.current = null;
@@ -1531,7 +1532,7 @@ export function SpecsWorkspace({
       if (detailRef.current?.spec.id === id) refetchDetail(id);
     },
   });
-  const { editing, saveState } = draft;
+  const { saveState } = draft;
   const { title: titleDraft, summary: summaryDraft, content: contentDraft } = draft.values;
 
   // Shells without a visible list (or before the user picks) open the most
@@ -1577,22 +1578,21 @@ export function SpecsWorkspace({
     if (selectedSlug !== detail.spec.id) onSelectSpec(detail.spec.id, true);
     if (pendingCreateRef.current === detail.spec.id) {
       pendingCreateRef.current = null;
-      draft.beginEdit();
       focusTitleRef.current = true;
     }
   }, [detailKey, detail, selectedSlug, onSelectSpec]);
 
   useEffect(() => {
-    if (!editing || !focusTitleRef.current) return;
+    if (!focusTitleRef.current) return;
     focusTitleRef.current = false;
     const input = titleInputRef.current;
     if (input !== null) {
       input.focus();
       input.select();
     }
-  }, [editing, detailKey]);
+  }, [detailKey]);
 
-  useAnnotationHighlights(previewRef, detail?.annotations ?? [], detailKey);
+  useAnnotationHighlights(previewRef, detail?.annotations ?? [], `${detailKey}:${draft.editorVersion}:${contentDraft}`);
 
   const projectNames = useMemo(
     () => new Map(projects.map((project) => [project.id, project.name])),
@@ -1603,16 +1603,23 @@ export function SpecsWorkspace({
     (annotation) => annotation.status === "open",
   );
 
+  const saveCurrentDraft = async () => {
+    if (!await draft.save()) throw new Error("Save or discard your draft before continuing.");
+  };
+  const reviewDiff = async (target: DiffTarget) => {
+    try { await saveCurrentDraft(); setDiffTarget(target); }
+    catch (cause) { toast.error(messageOf(cause)); }
+  };
+
   const save = async () => {
     if (await draft.save()) toast.success("Spec saved");
   };
 
   // Dismiss floating pieces on Escape or outside press.
   useEffect(() => {
-    if (selectionMenu === null && annotationDraft === null) return;
+    if (annotationDraft === null) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        setSelectionMenu(null);
         setAnnotationDraft(null);
       }
     };
@@ -1625,7 +1632,6 @@ export function SpecsWorkspace({
       ) {
         return;
       }
-      setSelectionMenu(null);
       setAnnotationDraft(null);
     };
     document.addEventListener("keydown", onKey);
@@ -1634,15 +1640,9 @@ export function SpecsWorkspace({
       document.removeEventListener("keydown", onKey);
       document.removeEventListener("mousedown", onDown);
     };
-  }, [selectionMenu, annotationDraft]);
+  }, [annotationDraft]);
 
-  const beginEdit = () => {
-    draft.beginEdit();
-  };
-
-  const finishEdit = () => void draft.finishEdit();
-
-  const cancelEdit = () => draft.discard();
+  const discardDraft = () => draft.discard();
 
   const selectSpec = (slug: string) => {
     if (slug === selectedSlug) return;
@@ -1749,37 +1749,7 @@ export function SpecsWorkspace({
     }
   };
 
-  const startChat = async () => {
-    if (detail === null || chatBusy) return;
-    setChatBusy(true);
-    try {
-      const result = await rpc.call("chat_ensure", { specId: detail.spec.id });
-      toast.success(result.created ? "Chat thread created" : "Chat thread ready");
-      refetchDetail(selectedSlug);
-      setRailAndNavigate("chat");
-    } catch (cause) {
-      toast.error(messageOf(cause));
-    } finally {
-      setChatBusy(false);
-    }
-  };
-
-  const postDiscussion = async () => {
-    const value = chatText.trim();
-    if (detail === null || value === "" || chatBusy) return;
-    setChatBusy(true);
-    try {
-      await rpc.call("discussion_post", { specId: detail.spec.id, body: value });
-      setChatText("");
-      refetchDetail(selectedSlug);
-    } catch (cause) {
-      toast.error(messageOf(cause));
-    } finally {
-      setChatBusy(false);
-    }
-  };
-
-  const askAgentChat = async () => {
+  const sendChat = async () => {
     const raw = chatText.trim();
     if (detail === null || raw === "" || chatBusy) return;
     const value = raw.toLowerCase().startsWith("@agent")
@@ -1788,6 +1758,7 @@ export function SpecsWorkspace({
     if (value === "") return;
     setChatBusy(true);
     try {
+      await saveCurrentDraft();
       await rpc.call("chat_ask", { specId: detail.spec.id, text: value });
       setChatText("");
       toast.success("Sent to the agent");
@@ -1799,20 +1770,12 @@ export function SpecsWorkspace({
     }
   };
 
-  const sendChat = async () => {
-    const value = chatText.trim();
-    if (value === "") return;
-    if (value.toLowerCase().startsWith("@agent")) {
-      await askAgentChat();
-      return;
-    }
-    await postDiscussion();
-  };
 
   const applyProposal = async (proposalId: string) => {
     if (proposalBusy) return;
     setProposalBusy(true);
     try {
+      await saveCurrentDraft();
       const result = await rpc.call("proposals_apply", { proposalId });
       toast.success(`Applied as v${result.revision}`);
       refetchList();
@@ -1859,6 +1822,7 @@ export function SpecsWorkspace({
     if (detail === null || changeBusy) return;
     setChangeBusy(true);
     try {
+      await saveCurrentDraft();
       const result = await rpc.call("specs_revert", {
         id: detail.spec.id,
         toRevision,
@@ -1873,11 +1837,30 @@ export function SpecsWorkspace({
     }
   };
 
+  const reviewResearch = async (run: Research) => {
+    try {
+      await saveCurrentDraft();
+      const parent = await rpc.call("specs_get", { idOrSlug: run.specId });
+      const proposal = parent.proposals.find((item) => item.id === run.proposalId);
+      if (proposal === undefined) throw new Error("This update is no longer available. Refresh or prepare a new update.");
+      void reviewDiff({ specId: parent.spec.id, title: `Research update: ${parent.spec.title}`, from: proposal.baseRevision, to: null, content: proposal.content, proposal, current: parent.spec });
+    } catch (cause) { toast.error(messageOf(cause)); }
+  };
+  const prepareResearch = async (run: Research) => {
+    try { await rpc.call("research_prepare", { researchId: run.id }); refetchDetail(selectedSlug); }
+    catch (cause) { toast.error(messageOf(cause)); }
+  };
+  const viewResearchRevision = (run: Research) => {
+    if (run.incorporatedRevision === null) return;
+    void reviewDiff({ specId: run.specId, title: "Research incorporated into parent", from: Math.max(1, run.incorporatedRevision - 1), to: run.incorporatedRevision });
+  };
+
   const startResearch = async () => {
     const brief = researchBrief.trim();
     if (detail === null || brief === "" || researchBusy) return;
     setResearchBusy(true);
     try {
+      await saveCurrentDraft();
       await rpc.call("research_start", { specId: detail.spec.id, brief });
       setResearchOpen(false);
       setResearchBrief("");
@@ -1895,6 +1878,7 @@ export function SpecsWorkspace({
     const body = annotationDraft.body.trim();
     if (body === "") return;
     try {
+      if (!await draft.save()) throw new Error("Save your document changes before adding a comment.");
       await rpc.call("annotations_create", {
         specId: detail.spec.id,
         quote: annotationDraft.quote,
@@ -1920,10 +1904,6 @@ export function SpecsWorkspace({
   const locateAnnotation = (annotation: Annotation) => {
     const container = previewRef.current;
     if (container === null) return;
-    if (editing) {
-      toast("Leave edit mode to find the quote.");
-      return;
-    }
     const range = findAnnotationRange(container, annotation);
     if (range === null) {
       toast.error("That quote is no longer in the document.");
@@ -1934,35 +1914,6 @@ export function SpecsWorkspace({
       (range.startContainer as HTMLElement | null);
     element?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
-
-  const handleMouseUp = () => {
-    if (editing) return;
-    const container = previewRef.current;
-    if (container === null) {
-      setSelectionMenu(null);
-      return;
-    }
-    const location = captureSelection(container);
-    if (location === null) {
-      setSelectionMenu(null);
-      return;
-    }
-    const selection = window.getSelection();
-    if (selection === null || selection.rangeCount === 0) return;
-    const rect = selection.getRangeAt(0).getBoundingClientRect();
-    setSelectionMenu({
-      ...location,
-      x: rect.left + rect.width / 2,
-      y: rect.top,
-    });
-  };
-
-  const toolbarTop =
-    selectionMenu === null
-      ? 0
-      : selectionMenu.y - 48 < 8
-        ? selectionMenu.y + 28
-        : selectionMenu.y - 48;
 
   const popoverLeft =
     annotationDraft === null
@@ -2130,26 +2081,10 @@ export function SpecsWorkspace({
                   <Icon name="Plus" className="size-4" />
                 </IconButton>
               </span>
-              {editing ? (
-                <>
-                  <span className="pr-1 text-[11px] text-muted-foreground tabular-nums">
-                    {saveState === "saving"
-                      ? "Saving…"
-                      : saveState === "saved"
-                        ? "Saved"
-                        : saveState === "error"
-                          ? "Not saved"
-                          : "Draft"}
-                  </span>
-                  <Button size="sm" variant="ghost" onClick={cancelEdit} disabled={saveState === "saving"}>
-                    Cancel
-                  </Button>
-                  <Button size="sm" onClick={finishEdit}>
-                    Done
-                  </Button>
-                </>
-              ) : (
-                <>
+              <span className="pr-1 text-[11px] text-muted-foreground" role="status">
+                {saveState === "saving" ? "Saving…" : saveState === "error" ? "Not saved" : draft.dirty ? "Unsaved changes" : "Saved"}
+              </span>
+              <>
                   <IconButton
                     label="Comments"
                     active={rail === "comments"}
@@ -2172,9 +2107,10 @@ export function SpecsWorkspace({
                     <Icon name="MessageCirclePlus" className="size-4" />
                   </IconButton>
                   <span className="mx-1 h-4 w-px bg-border" />
-                  <IconButton label="Edit" onClick={beginEdit}>
-                    <Icon name="Edit" className="size-4" />
-                  </IconButton>
+                  <Button size="sm" variant="ghost" onClick={() => {
+                    setChatText("Create a Mermaid diagram explaining this spec. Propose it inside the document. ");
+                    setRailAndNavigate("chat");
+                  }}>Add diagram</Button>
                   <IconButton
                     label="Run research"
                     onClick={() => setResearchOpen(true)}
@@ -2188,10 +2124,9 @@ export function SpecsWorkspace({
                     <Icon name="Trash2" className="size-4" />
                   </IconButton>
                 </>
-              )}
             </div>
 
-            {editing && (draft.saveError !== null || draft.storageError) ? (
+            {(draft.saveError !== null || draft.storageError) ? (
               <div role="alert" className="border-b border-border bg-secondary px-4 py-3 text-sm">
                 <p>{draft.saveError ?? "This browser cannot store a recovery copy. Keep this window open until your draft saves."}</p>
                 {draft.saveError === null ? null : (
@@ -2207,17 +2142,20 @@ export function SpecsWorkspace({
                     );
                   }}>Copy draft</Button>
                   {draft.conflict ? null : <Button size="sm" onClick={() => void save()}>Retry save</Button>}
-                  <Button size="sm" variant="ghost" disabled={saveState === "saving"} onClick={cancelEdit}>Discard draft</Button>
+                  <Button size="sm" variant="ghost" disabled={saveState === "saving"} onClick={discardDraft}>Discard draft</Button>
                 </div>
               </div>
             ) : null}
 
             <div
               ref={scrollRef}
-              onScroll={() => setSelectionMenu(null)}
-              onMouseUp={handleMouseUp}
               className="specs-scroll min-h-0 flex-1 overflow-y-auto"
             >
+              {detail.spec.parent === null ? null : <div className="mx-auto w-full max-w-3xl px-6 pt-4">
+                <button type="button" className="text-sm text-primary hover:underline" onClick={() => selectSpec(detail.spec.parent!.id)}>← Research for {detail.spec.parent.title}</button>
+                {detail.sourceResearch === null ? null : <ResearchCard reportOpen run={detail.sourceResearch} onOpenRun={() => onOpenThread(detail.sourceResearch!.threadId)} onOpenResult={() => setRailAndNavigate("comments")} onReview={() => void reviewResearch(detail.sourceResearch!)} onPrepare={() => prepareResearch(detail.sourceResearch!)} onViewRevision={() => viewResearchRevision(detail.sourceResearch!)} />}
+              </div>}
+
               <div className="mx-auto w-full max-w-[720px] px-6 pb-40 pt-12 md:px-10">
                 <div className="mb-2">
                   <button
@@ -2230,47 +2168,18 @@ export function SpecsWorkspace({
                   </button>
                 </div>
 
-                {editing ? (
-                  <input
-                    ref={titleInputRef}
-                    value={titleDraft}
-                    onChange={(event) => draft.update({ title: event.target.value })}
-                    onKeyDown={(event) => {
-                      if ((event.metaKey || event.ctrlKey) && event.key === "s") {
-                        event.preventDefault();
-                        void save();
-                      }
-                      if (event.key === "Enter" && !event.shiftKey) {
-                        event.preventDefault();
-                        focusSpecEditor();
-                      }
-                      if (event.key === "Escape") finishEdit();
-                    }}
-                    placeholder="Untitled"
-                    className="w-full bg-transparent text-3xl font-semibold tracking-tight text-foreground outline-none placeholder:text-muted-foreground/40 md:text-4xl"
-                  />
-                ) : (
-                  <h1
-                    onClick={beginEdit}
-                    title="Click to edit"
-                    className="cursor-text text-3xl font-semibold tracking-tight text-balance md:text-4xl"
-                  >
-                    {detail.spec.title}
-                  </h1>
-                )}
-
-                {editing ? (
-                  <input
-                    value={summaryDraft}
-                    onChange={(event) => draft.update({ summary: event.target.value })}
-                    placeholder="Add a one-line summary…"
-                    className="mt-2 w-full bg-transparent text-sm text-muted-foreground outline-none placeholder:text-muted-foreground/40"
-                  />
-                ) : detail.spec.summary === "" ? null : (
-                  <p className="mt-2 text-sm text-muted-foreground text-pretty">
-                    {detail.spec.summary}
-                  </p>
-                )}
+                <h1 aria-label={titleDraft}><input
+                  ref={titleInputRef} aria-label="Spec title" value={titleDraft}
+                  onChange={(event) => draft.update({ title: event.target.value })}
+                  onKeyDown={(event) => {
+                    if ((event.metaKey || event.ctrlKey) && event.key === "s") { event.preventDefault(); void save(); }
+                    if (event.key === "Enter") { event.preventDefault(); focusSpecEditor(); }
+                  }}
+                  placeholder="Untitled" className="w-full bg-transparent text-3xl font-semibold tracking-tight text-foreground outline-none placeholder:text-muted-foreground/40 md:text-4xl"
+                /></h1>
+                <input aria-label="Spec summary" value={summaryDraft}
+                  onChange={(event) => draft.update({ summary: event.target.value })}
+                  placeholder="Add a one-line summary…" className="mt-2 w-full bg-transparent text-sm text-muted-foreground outline-none placeholder:text-muted-foreground/40" />
 
                 <div className="mt-3 flex items-center gap-1.5 text-[11px] text-muted-foreground tabular-nums">
                   <span>v{detail.spec.revision}</span>
@@ -2314,7 +2223,7 @@ export function SpecsWorkspace({
                         change={detail.agentChange}
                         busy={changeBusy}
                         onReview={() =>
-                          setDiffTarget({
+                          void reviewDiff({
                             specId: detail.spec.id,
                             title: detail.spec.title,
                             from:
@@ -2334,14 +2243,14 @@ export function SpecsWorkspace({
                         }
                       />
                     )}
-                    {detail.proposals.filter((proposal) => !detail.annotations.some((annotation) => annotation.id === proposal.questionId && annotation.status === "open")).map((proposal) => (
+                    {detail.proposals.filter((proposal) => proposal.researchId === null && !detail.annotations.some((annotation) => annotation.id === proposal.questionId && annotation.status === "open")).map((proposal) => (
                       <ProposalCard
                         current={detail.spec}
                         key={proposal.id}
                         proposal={proposal}
                         busy={proposalBusy}
                         onReview={() =>
-                          setDiffTarget({
+                          void reviewDiff({
                             specId: detail.spec.id,
                             title:
                               proposal.note === ""
@@ -2356,10 +2265,13 @@ export function SpecsWorkspace({
                         onReject={(note) => void rejectProposal(proposal.id, note)}
                       />
                     ))}
-                    {detail.research.slice(0, 3).map((run) => (
+                    {detail.research.map((run) => (
                       <ResearchCard
                         key={run.id}
                         run={run}
+                        onReview={() => void reviewResearch(run)}
+                        onPrepare={() => prepareResearch(run)}
+                        onViewRevision={() => viewResearchRevision(run)}
                         onOpenRun={() => onOpenThread(run.threadId)}
                         onOpenResult={() => {
                           if (run.resultSpecId !== null) {
@@ -2372,33 +2284,33 @@ export function SpecsWorkspace({
                 )}
 
                 <div className="mt-6 border-t border-border pt-6">
-                  {editing ? (
                     <MarkdownEditor
                       key={`${detail.spec.id}:${draft.editorVersion}`}
                       value={contentDraft}
+                      rootRef={previewRef}
+                      onComment={(location, position, kind) => setAnnotationDraft({ ...location, ...position, body: "", kind })}
+                      onAsk={(quote) => { setChatText(`About this passage:\n> ${quote}\n\n`); setRailAndNavigate("chat"); }}
+                      onDiscussDiagram={(source) => {
+                        setChatText(`Please refine this diagram in this spec. Read the current document and propose the change.\n\nCurrent Mermaid source:\n\`\`\`mermaid\n${source}\n\`\`\`\n\nRequested change: `);
+                        setRailAndNavigate("chat");
+                      }}
                       onChange={(content) => draft.update({ content })}
                       onSave={() => void save()}
-                      onEscape={finishEdit}
+                      onDraft={async (location, request) => {
+                        const specId = detail.spec.id;
+                        draft.update({ content: location.content });
+                        if (!await draft.save()) throw new Error("Save your document changes before asking the agent. Your request is still here.");
+                        const saved = await rpc.call("specs_get", { idOrSlug: specId });
+                        if (saved.spec.content !== location.content) throw new Error("The document changed. Cancel and choose the insertion point again.");
+                        if (detailRef.current?.spec.id !== specId) throw new Error("The selected document changed. Open the original spec to try again.");
+                        await rpc.call("chat_draft", { specId, text: request, expectedRevision: saved.spec.revision, insertionOffset: location.insertionOffset });
+                        if (detailRef.current?.spec.id === specId) {
+                          setRailAndNavigate("chat");
+                          refetchDetail(specId);
+                          toast.success("Draft requested — review the proposal when it’s ready");
+                        }
+                      }}
                     />
-                  ) : detail.spec.content.trim() === "" ? (
-                    <div className="rounded-xl border border-dashed border-border px-6 py-10 text-center">
-                      <p className="text-sm text-muted-foreground">
-                        This spec is empty.
-                      </p>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="mt-3"
-                        onClick={beginEdit}
-                      >
-                        Start writing
-                      </Button>
-                    </div>
-                  ) : (
-                    <div ref={previewRef} className="specs-doc">
-                      <Markdown content={detail.spec.content} />
-                    </div>
-                  )}
                 </div>
               </div>
             </div>
@@ -2452,12 +2364,13 @@ export function SpecsWorkspace({
                 }
               }}
               proposals={detail.proposals}
-              onReview={(proposal, annotation) => setDiffTarget({
+              onReview={(proposal, annotation) => void reviewDiff({
                 specId: detail.spec.id, title: proposal.note || detail.spec.title,
                 from: proposal.baseRevision, to: null, content: proposal.content,
                 proposal, annotation, current: detail.spec,
               })}
               onAccept={async (annotation) => {
+                await saveCurrentDraft();
                 await rpc.call("questions_accept", { annotationId: annotation.id, expectedAnswer: annotation.answer, expectedUpdatedAt: annotation.updatedAt });
                 refetchDetail(selectedSlug);
                 refetchList();
@@ -2493,54 +2406,33 @@ export function SpecsWorkspace({
                 }
               }}
             />
-          ) : detail.chatThreadId === null ? (
-            <>
-              <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
-                <span className="min-w-0 flex-1 text-xs font-medium">Chat</span>
-                <IconButton label="Close chat" onClick={() => setRailAndNavigate("none")}>
-                  <Icon name="X" className="size-3.5" />
-                </IconButton>
-              </div>
-              <div className="flex min-h-0 flex-1 items-center justify-center p-6">
-                <div className="space-y-3 text-center">
-                  <EmptyState>
-                    Chat creates a real BB thread linked to this spec, so the agent
-                    can read and update it and the conversation stays in the
-                    sidebar.
-                  </EmptyState>
-                  <Button onClick={() => void startChat()} disabled={chatBusy}>
-                    <Icon name="MessageCirclePlus" className="size-4" />
-                    {chatBusy ? "Starting…" : "Start chat"}
-                  </Button>
-                </div>
-              </div>
-            </>
           ) : (
             <div className="flex min-h-0 flex-1 flex-col">
               <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-3">
                 <button
                   type="button"
-                  onClick={() => onOpenThread(detail.chatThreadId!)}
+                  disabled={detail.chatThreadId === null}
+                  onClick={() => { if (detail.chatThreadId !== null) onOpenThread(detail.chatThreadId); }}
                   className="min-w-0 flex-1 cursor-pointer truncate text-left text-xs font-medium hover:underline"
                 >
                   Chat
                 </button>
-                <IconButton
+                {detail.chatThreadId === null ? null : <IconButton
                   label="Open thread in sidebar"
-                  onClick={() => onOpenThread(detail.chatThreadId!)}
+                  onClick={() => { if (detail.chatThreadId !== null) onOpenThread(detail.chatThreadId); }}
                 >
                   <Icon name="NewTab" className="size-3.5" />
-                </IconButton>
+                </IconButton>}
                 <IconButton label="Close chat" onClick={() => setRailAndNavigate("none")}>
                   <Icon name="X" className="size-3.5" />
                 </IconButton>
               </div>
               <div className="min-h-0 flex-1">
-                <ThreadChat
+                {detail.chatThreadId === null ? <div className="p-6"><EmptyState>Ask a question or describe a change to this spec.</EmptyState></div> : <ThreadChat
                   threadId={detail.chatThreadId}
                   variant="timeline"
                   className="h-full"
-                />
+                />}
               </div>
               <div className="shrink-0 border-t border-border p-3">
                 {detail.discussion.length === 0 ? null : (
@@ -2570,7 +2462,7 @@ export function SpecsWorkspace({
                 <textarea
                   value={chatText}
                   onChange={(event) => setChatText(event.target.value)}
-                  placeholder="Discuss — or start with @agent to run the agent…"
+                  placeholder="Discuss this spec or ask for a change…"
                   className={cn(textareaClassName, "mt-2 h-16 rounded-xl text-sm")}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
@@ -2580,80 +2472,14 @@ export function SpecsWorkspace({
                   }}
                 />
                 <div className="mt-1.5 flex items-center justify-between gap-2">
-                  <span className="text-[10px] text-muted-foreground">
-                    Posts are context; only @agent runs the agent.
-                  </span>
-                  <span className="flex shrink-0 gap-1.5">
-                    <Button
-                      size="sm"
-                      variant="ghost"
-                      className="h-7 px-2"
-                      disabled={chatBusy || chatText.trim() === ""}
-                      onClick={() => void postDiscussion()}
-                    >
-                      Post
-                    </Button>
-                    <Button
-                      size="sm"
-                      className="h-7 px-2.5"
-                      disabled={chatBusy || chatText.trim() === ""}
-                      onClick={() => void askAgentChat()}
-                    >
-                      Ask agent
-                    </Button>
-                  </span>
+                  <span className="text-[10px] text-muted-foreground">The agent replies here. Document changes are reviewed before applying.</span>
+                  <Button size="sm" disabled={chatBusy || !chatText.trim()} onClick={() => void sendChat()}>{chatBusy ? "Sending…" : "Send"}</Button>
                 </div>
               </div>
             </div>
           )}
         </aside>
       ) : null}
-
-      {selectionMenu === null ? null : (
-        <div
-          className="specs-toolbar"
-          style={{ left: selectionMenu.x, top: toolbarTop }}
-          onMouseDown={(event) => event.preventDefault()}
-        >
-          <button
-            type="button"
-            onClick={() => {
-              void navigator.clipboard.writeText(selectionMenu.quote).then(
-                () => toast.success("Copied"),
-                () => toast.error("Could not copy"),
-              );
-              setSelectionMenu(null);
-            }}
-            className="specs-press flex cursor-pointer items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-state-hover hover:text-foreground"
-          >
-            <Icon name="Copy" className="size-3.5" />
-            Copy
-          </button>
-          <span className="mx-0.5 h-4 w-px bg-border" />
-          <button
-            type="button"
-            onClick={() => {
-              setAnnotationDraft({ ...selectionMenu, body: "", kind: "note" });
-              setSelectionMenu(null);
-            }}
-            className="specs-press flex cursor-pointer items-center gap-1.5 rounded-lg bg-foreground px-2.5 py-1.5 text-xs font-medium text-background hover:bg-foreground/90"
-          >
-            <Icon name="MessageSquare" className="size-3.5" />
-            Comment
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setAnnotationDraft({ ...selectionMenu, body: "", kind: "question" });
-              setSelectionMenu(null);
-            }}
-            className="specs-press flex cursor-pointer items-center gap-1.5 rounded-lg border border-input px-2.5 py-1.5 text-xs font-medium hover:bg-state-hover"
-          >
-            <Icon name="MessageQuestion" className="size-3.5" />
-            Question
-          </button>
-        </div>
-      )}
 
       {annotationDraft === null ? null : (
         <div
@@ -2766,6 +2592,7 @@ export function SpecsWorkspace({
         </DialogContent>
       </Dialog>
 
+
       <Dialog open={researchOpen} onOpenChange={setResearchOpen}>
         <DialogContent className="max-w-lg rounded-2xl">
           <DialogHeader>
@@ -2804,7 +2631,8 @@ export function SpecsWorkspace({
       </Dialog>
 
       <DiffDialog
-        onApplied={() => { refetchDetail(selectedSlug); refetchList(); toast.success("Spec updated and question closed"); }}
+        beforeApply={saveCurrentDraft}
+        onApplied={(outcome) => { refetchDetail(selectedSlug); refetchList(); toast.success(outcome ?? "Change applied"); }}
         target={diffTarget}
         onOpenChange={(open) => {
           if (!open) setDiffTarget(null);
@@ -2845,9 +2673,9 @@ function SpecPicker({
   const [query, setQuery] = useState("");
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (needle === "") return specs ?? [];
+    if (needle === "") return (specs ?? []).filter((spec) => spec.parent === null);
     return (specs ?? []).filter((spec) =>
-      `${spec.title} ${spec.slug} ${spec.summary}`.toLowerCase().includes(needle),
+      `${spec.title} ${spec.slug} ${spec.summary} ${spec.parent?.title ?? ""}`.toLowerCase().includes(needle),
     );
   }, [specs, query]);
   const groups = useMemo(
@@ -2921,7 +2749,7 @@ function SpecPicker({
                             {spec.title}
                           </span>
                           <span className="block truncate text-[11px] text-muted-foreground tabular-nums">
-                            {group.label} · v{spec.revision} ·{" "}
+                            {spec.parent === null ? group.label : `Research for ${spec.parent.title}`} · v{spec.revision} ·{" "}
                             {relativeTime(spec.updatedAt)}
                           </span>
                         </span>

@@ -29,11 +29,9 @@ describe("spec draft recovery and concurrency", () => {
   it("refreshes an idle editor without writing the old revision back", async () => {
     const initial = spec();
     const view = setup(initial);
-    act(() => view.result.current.beginEdit());
     view.rerender({ current: { ...initial, revision: 2, content: "External update" } });
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(view.result.current.values.content).toBe("External update");
-    expect(view.result.current.editing).toBe(true);
     expect(view.result.current.dirty).toBe(false);
     expect(view.result.current.editorVersion).toBe(1);
     expect(view.save).not.toHaveBeenCalled();
@@ -42,40 +40,37 @@ describe("spec draft recovery and concurrency", () => {
   it("retains a dirty draft and refuses to advance its token after an external update", async () => {
     const initial = spec();
     const view = setup(initial);
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "My draft" }); });
+    act(() => { view.result.current.update({ content: "My draft" }); });
     view.rerender({ current: { ...initial, revision: 2, content: "External update" } });
     await act(async () => { await vi.advanceTimersByTimeAsync(2000); });
     expect(view.result.current.values.content).toBe("My draft");
     expect(view.result.current.conflict).toBe(true);
     expect(view.result.current.saveError).toContain("changed elsewhere");
-    await act(async () => { expect(await view.result.current.finishEdit()).toBe(false); });
-    expect(view.result.current.editing).toBe(true);
+    await act(async () => { expect(await view.result.current.save()).toBe(false); });
     expect(view.save).not.toHaveBeenCalled();
     expect(JSON.parse(sessionStorage.getItem(`specs:draft:test:${initial.id}`)!)).toMatchObject({
       revision: 1, values: { content: "My draft" },
     });
   });
 
-  it("drains edits during a slow request and makes Done await the entire queue", async () => {
+  it("drains edits during a slow request and makes explicit save await the entire queue", async () => {
     const initial = spec();
     const first = deferred<{ revision: number }>();
     const second = deferred<{ revision: number }>();
     const save = vi.fn().mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
     const view = setup(initial, save);
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "First edit" }); });
+    act(() => { view.result.current.update({ content: "First edit" }); });
     await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
     act(() => view.result.current.update({ content: "Second edit" }));
     await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
     expect(save).toHaveBeenCalledTimes(1);
     let done!: Promise<boolean>;
-    act(() => { done = view.result.current.finishEdit(); });
+    act(() => { done = view.result.current.save(); });
     await act(async () => { first.resolve({ revision: 2 }); await Promise.resolve(); });
     expect(save).toHaveBeenCalledTimes(2);
     expect(save.mock.calls[0][0]).toMatchObject({ content: "First edit", expectedRevision: 1 });
     expect(save.mock.calls[1][0]).toMatchObject({ content: "Second edit", expectedRevision: 2 });
-    expect(view.result.current.editing).toBe(true);
     await act(async () => { second.resolve({ revision: 3 }); expect(await done).toBe(true); });
-    expect(view.result.current.editing).toBe(false);
     expect(view.result.current.dirty).toBe(false);
     expect(sessionStorage.getItem(`specs:draft:test:${initial.id}`)).toBeNull();
   });
@@ -85,26 +80,23 @@ describe("spec draft recovery and concurrency", () => {
     const next = { ...spec(), content: "Next document" };
     const pending = deferred<{ revision: number }>();
     const view = setup(initial, vi.fn().mockReturnValue(pending.promise));
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "Keep me" }); });
+    act(() => { view.result.current.update({ content: "Keep me" }); });
     await act(async () => { view.rerender({ current: next }); });
     expect(view.save).toHaveBeenCalledWith(expect.objectContaining({ id: initial.id, content: "Keep me", expectedRevision: 1 }));
     await act(async () => { pending.resolve({ revision: 2 }); await Promise.resolve(); });
     expect(view.result.current.values.content).toBe("Next document");
-    expect(view.result.current.editing).toBe(false);
   });
 
   it("retains failed saves on Done and recovers them after unmount", async () => {
     const initial = spec();
     const save = vi.fn().mockRejectedValue(new Error("Offline"));
     const view = setup(initial, save);
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "Offline draft" }); });
-    await act(async () => { expect(await view.result.current.finishEdit()).toBe(false); });
-    expect(view.result.current.editing).toBe(true);
+    act(() => { view.result.current.update({ content: "Offline draft" }); });
+    await act(async () => { expect(await view.result.current.save()).toBe(false); });
     expect(view.result.current.saveError).toBe("Offline");
     view.unmount();
     const reopened = setup(initial);
     expect(reopened.result.current.values.content).toBe("Offline draft");
-    expect(reopened.result.current.editing).toBe(true);
     expect(reopened.result.current.saveError).toBe("Offline");
     expect(save).toHaveBeenCalledTimes(1);
   });
@@ -113,7 +105,7 @@ describe("spec draft recovery and concurrency", () => {
     const initial = spec();
     const pending = deferred<{ revision: number }>();
     const view = setup(initial, vi.fn().mockReturnValue(pending.promise));
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "Closing draft" }); });
+    act(() => { view.result.current.update({ content: "Closing draft" }); });
     await act(async () => { view.unmount(); });
     expect(view.save).toHaveBeenCalledTimes(1);
     await act(async () => { pending.reject(new Error("Offline")); await Promise.resolve(); });
@@ -131,7 +123,6 @@ describe("spec draft recovery and concurrency", () => {
     }));
     const view = setup({ ...initial, revision: 2, content: "Changed elsewhere" });
     expect(view.result.current.values.content).toBe("Recovered edit");
-    expect(view.result.current.editing).toBe(true);
     expect(view.result.current.conflict).toBe(true);
     expect(view.save).not.toHaveBeenCalled();
   });
@@ -140,7 +131,7 @@ describe("spec draft recovery and concurrency", () => {
     const initial = spec();
     const pending = deferred<{ revision: number }>();
     const view = setup(initial, vi.fn().mockReturnValue(pending.promise));
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "Saved edit" }); });
+    act(() => { view.result.current.update({ content: "Saved edit" }); });
     await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
     view.rerender({ current: { ...initial, revision: 2, content: "Saved edit" } });
     await act(async () => { pending.resolve({ revision: 2 }); await Promise.resolve(); });
@@ -154,7 +145,7 @@ describe("spec draft recovery and concurrency", () => {
     const initial = spec();
     const pending = deferred<{ revision: number }>();
     const view = setup(initial, vi.fn().mockReturnValue(pending.promise));
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "In flight" }); });
+    act(() => { view.result.current.update({ content: "In flight" }); });
     await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
     act(() => view.result.current.update({ content: initial.content }));
     expect(JSON.parse(sessionStorage.getItem(`specs:draft:test:${initial.id}`)!)).toMatchObject({
@@ -172,7 +163,7 @@ describe("spec draft recovery and concurrency", () => {
     const save = vi.fn().mockImplementationOnce(() => { throw new Error("Client unavailable"); })
       .mockResolvedValue({ revision: 2 });
     const view = setup(initial, save);
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "Retry this" }); });
+    act(() => { view.result.current.update({ content: "Retry this" }); });
     await act(async () => { expect(await view.result.current.save()).toBe(false); });
     await act(async () => { expect(await view.result.current.save()).toBe(true); });
     expect(save).toHaveBeenCalledTimes(2);
@@ -183,7 +174,7 @@ describe("spec draft recovery and concurrency", () => {
     const initial = spec();
     const pending = deferred<{ revision: number }>();
     const view = setup(initial, vi.fn().mockReturnValue(pending.promise));
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "Pending reopen" }); });
+    act(() => { view.result.current.update({ content: "Pending reopen" }); });
     await act(async () => { await vi.advanceTimersByTimeAsync(1200); });
     view.unmount();
     const reopened = setup(initial);
@@ -198,7 +189,7 @@ describe("spec draft recovery and concurrency", () => {
     const initial = spec();
     const storage = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("Quota exceeded"); });
     const view = setup(initial, vi.fn().mockRejectedValue(new Error("Offline")));
-    act(() => { view.result.current.beginEdit(); view.result.current.update({ content: "Memory recovery" }); });
+    act(() => { view.result.current.update({ content: "Memory recovery" }); });
     expect(view.result.current.storageError).toBe(true);
     await act(async () => { view.unmount(); });
     const reopened = setup(initial);

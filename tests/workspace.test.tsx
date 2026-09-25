@@ -3,7 +3,10 @@ import { useState } from "react";
 import { act, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { $getRoot, getNearestEditorFromDOMNode } from "lexical";
 import type { SpecDetail } from "../server";
+
+vi.mock("mermaid", () => ({ default: { initialize: () => {}, render: async () => ({ svg: '<svg xmlns="http://www.w3.org/2000/svg"></svg>' }) } }));
 
 let Workspace: typeof import("../app").SpecsWorkspace;
 beforeAll(async () => {
@@ -20,10 +23,10 @@ function detail(title: string): SpecDetail {
       id, title, slug: title.toLowerCase().replaceAll(" ", "-"), summary: "", content: `${title} content`,
       revision: 1, status: "active", icon: "📄", updatedAt: "2026-09-22T10:00:00Z",
       projectIds: [], openAnnotations: 0,
-      contextMode: "none",
+      contextMode: "none", parent: null,
     },
     annotations: [], links: [], chatThreadId: null, textQuestions: [], textDecisions: [],
-    proposals: [], decisions: [], research: [], discussion: [], agentChange: null,
+    proposals: [], decisions: [], research: [], sourceResearch: null, discussion: [], agentChange: null,
   };
 }
 function deferred<T>() {
@@ -85,9 +88,8 @@ describe("workspace selection and saving", () => {
       },
     });
     await waitFor(() => expect(view.getByRole("heading", { name: "Untitled" })).toBeTruthy());
-    fireEvent.click(view.getByRole("button", { name: "Edit" }));
     fireEvent.change(view.getByPlaceholderText("Untitled"), { target: { value: "Project requirements" } });
-    fireEvent.click(view.getByRole("button", { name: "Done" }));
+    fireEvent.keyDown(view.getByLabelText("Spec content"), { key: "s", metaKey: true });
     await waitFor(() => expect(view.getByRole("heading", { name: "Project requirements" })).toBeTruthy());
     await view.emitRealtime("specs-changed", {});
     expect(view.queryByText("No spec matches")).toBeNull();
@@ -108,7 +110,6 @@ describe("workspace selection and saving", () => {
       },
     });
     await waitFor(() => expect(view.getByRole("heading", { name: "First draft" })).toBeTruthy());
-    fireEvent.click(view.getByRole("button", { name: "Edit" }));
     fireEvent.change(view.getByPlaceholderText("Untitled"), { target: { value: "Pending before navigation" } });
     fireEvent.click(view.getByRole("button", { name: /📄 Next document/ }));
     await waitFor(() => expect(view.getByRole("heading", { name: "Next document" })).toBeTruthy());
@@ -128,14 +129,46 @@ describe("workspace selection and saving", () => {
       },
     });
     await waitFor(() => expect(view.getByRole("heading", { name: "Live document" })).toBeTruthy());
-    fireEvent.click(view.getByRole("button", { name: "Edit" }));
     await waitFor(() => expect(view.getByLabelText("Spec content").textContent).toContain("Live document content"));
     current = { ...current, spec: { ...current.spec, revision: 2, content: "Latest text from another editor" } };
     await view.emitRealtime("specs-changed", {});
     await waitFor(() => expect(view.getByLabelText("Spec content").textContent).toContain("Latest text from another editor"));
-    fireEvent.click(view.getByRole("button", { name: "Done" }));
+    fireEvent.keyDown(view.getByLabelText("Spec content"), { key: "s", metaKey: true });
     await waitFor(() => expect(view.getByRole("heading", { name: "Live document" })).toBeTruthy());
     expect(save).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("saves pending edits before applying a proposal (save failure: %s)", async (fails) => {
+    const current = detail("Pending draft");
+    current.proposals = [{
+      id: "pending-proposal", specId: current.spec.id, baseRevision: 1,
+      title: "Proposed title", summary: "", icon: null, content: current.spec.content,
+      note: "Update title", author: "agent", questionId: null, researchId: null, status: "pending",
+      resolutionNote: "", resolvedBy: "", resolvedAt: null, appliedRevision: null, createdAt: current.spec.updatedAt,
+    }];
+    const save = vi.fn(async () => {
+      if (fails) throw new Error("Save unavailable");
+      return { revision: 2, updatedAt: current.spec.updatedAt };
+    });
+    const apply = vi.fn(async () => { throw new Error("Proposal is based on an older revision"); });
+    const view = renderSlot({ component: Host }, { initial: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current,
+      specs_save: save, proposals_apply: apply,
+    } });
+    await waitFor(() => expect(view.getByLabelText("Spec title")).toBeTruthy());
+    fireEvent.change(view.getByLabelText("Spec title"), { target: { value: "My pending title" } });
+    fireEvent.click(view.getByRole("button", { name: "Apply" }));
+    await waitFor(() => expect(save).toHaveBeenCalled());
+    if (fails) {
+      await waitFor(() => expect(view.getByText("Save unavailable")).toBeTruthy());
+      expect(apply).not.toHaveBeenCalled();
+      fireEvent.click(view.getByRole("button", { name: "Discard draft" }));
+      await waitFor(() => expect((view.getByLabelText("Spec title") as HTMLInputElement).value).toBe("Pending draft"));
+    } else {
+      await waitFor(() => expect(apply).toHaveBeenCalled());
+      expect(save.mock.invocationCallOrder[0]).toBeLessThan(apply.mock.invocationCallOrder[0]!);
+      expect((view.getByLabelText("Spec title") as HTMLInputElement).value).toBe("My pending title");
+    }
   });
 
   it("shows proposed title, summary, and icon changes before applying an unchanged body", async () => {
@@ -144,7 +177,7 @@ describe("workspace selection and saving", () => {
     current.proposals = [{
       id: "metadata-proposal", specId: current.spec.id, baseRevision: current.spec.revision,
       title: "Proposed title", summary: "Proposed summary", icon: "🧭", content: current.spec.content,
-      note: "Update document metadata", author: "agent", questionId: null, status: "pending",
+      note: "Update document metadata", author: "agent", questionId: null, researchId: null, status: "pending",
       resolutionNote: "", resolvedBy: "", resolvedAt: null, appliedRevision: null,
       createdAt: current.spec.updatedAt,
     }];
@@ -205,7 +238,7 @@ describe("conversation-first decisions", () => {
   it("shows content and metadata review before applying and closing", async () => {
     const current = detail("Review decision");
     current.annotations = [questionFixture(current, { requiresSpecChange: true })];
-    current.proposals = [{ id: "question-proposal", specId: current.spec.id, baseRevision: 1, title: "Changed title", summary: "Changed summary", icon: "🧭", content: "Seven days in the spec", note: "Set interval", author: "agent", questionId: "question-1", status: "pending", resolutionNote: "", resolvedBy: "", resolvedAt: null, appliedRevision: null, createdAt: current.spec.updatedAt }];
+    current.proposals = [{ id: "question-proposal", specId: current.spec.id, baseRevision: 1, title: "Changed title", summary: "Changed summary", icon: "🧭", content: "Seven days in the spec", note: "Set interval", author: "agent", questionId: "question-1", researchId: null, status: "pending", resolutionNote: "", resolvedBy: "", resolvedAt: null, appliedRevision: null, createdAt: current.spec.updatedAt }];
     const apply = vi.fn(async () => ({ revision: 2 }));
     const view = renderSlot({ component: Host }, { initial: current.spec.id }, { rpc: {
       specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current,
@@ -252,4 +285,139 @@ describe("conversation-first decisions", () => {
     await waitFor(() => expect(view.getByRole("alert").textContent).toContain("Save failed"));
     expect((view.getByLabelText("Recorded answer") as HTMLTextAreaElement).value).toBe("Three days");
   });
+});
+
+describe("document conversation", () => {
+  it("sends the first message directly without a separate start or post action", async () => {
+    const current = detail("Conversation");
+    const ask = vi.fn(() => ({ threadId: "chat-thread", created: true }));
+    const view = renderSlot({ component: Workspace }, { ...workspaceProps, selectedSlug: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current, chat_ask: ask,
+    } });
+    await waitFor(() => expect(view.getByRole("heading", { name: "Conversation" })).toBeTruthy());
+    fireEvent.click(view.getByRole("button", { name: "Chat" }));
+    fireEvent.change(view.getByPlaceholderText("Discuss this spec or ask for a change…"), { target: { value: "Explain the tradeoff" } });
+    fireEvent.click(view.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(ask).toHaveBeenCalledWith({ specId: current.spec.id, text: "Explain the tradeoff" }));
+    expect(view.queryByRole("button", { name: "Post" })).toBeNull();
+    expect(view.queryByRole("button", { name: "Ask agent" })).toBeNull();
+    expect(view.queryByRole("button", { name: "Start chat" })).toBeNull();
+  });
+
+  it("keeps research visibly linked and reviews the parent proposal from the report", async () => {
+    const parent = detail("Main design");
+    const report = detail("Evidence");
+    report.spec.parent = { id: parent.spec.id, title: parent.spec.title, slug: parent.spec.slug };
+    report.sourceResearch = { id: "research-1", specId: parent.spec.id, brief: "Compare options", status: "done", threadId: "run-thread", resultSpecId: report.spec.id, integrationState: "review", integrationError: "", proposalId: "parent-proposal", incorporatedRevision: null, error: "", createdAt: parent.spec.updatedAt, updatedAt: parent.spec.updatedAt };
+    parent.research = [report.sourceResearch];
+    parent.proposals = [{ id: "parent-proposal", specId: parent.spec.id, baseRevision: 1, title: parent.spec.title, summary: "", content: "Settled findings", icon: null, note: "Evidence", author: "agent", questionId: null, researchId: "research-1", status: "pending", resolutionNote: "", resolvedBy: "", resolvedAt: null, appliedRevision: null, createdAt: parent.spec.updatedAt }];
+    const apply = vi.fn(() => ({ revision: 2 }));
+    const view = renderSlot({ component: Workspace }, { ...workspaceProps, selectedSlug: report.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [report.spec, parent.spec], projects: [] }),
+      specs_get: (raw) => (raw as { idOrSlug: string }).idOrSlug === parent.spec.id ? parent : report,
+      specs_diff: () => ({ rows: [{ type: "add", text: "Settled findings" }] }), proposals_apply: apply,
+    } });
+    await waitFor(() => expect(view.getByText("← Research for Main design")).toBeTruthy());
+    fireEvent.click(view.getByRole("button", { name: "Review parent update" }));
+    await waitFor(() => expect(view.getByRole("button", { name: "Apply to parent" }).hasAttribute("disabled")).toBe(false));
+    expect(view.getByRole("button", { name: "Reject update" })).toBeTruthy();
+    fireEvent.click(view.getByRole("button", { name: "Apply to parent" }));
+    await waitFor(() => expect(apply).toHaveBeenCalledWith({ proposalId: "parent-proposal" }));
+  });
+});
+
+describe("diagrams in a working document", () => {
+  it("saves just the selected diagram with revision protection and retains a conflicted edit", async () => {
+    const current = detail("Diagram document");
+    current.spec.content = "Before\n\n```mermaid\nflowchart LR\n A --> B\n```\n\nAfter";
+    const save = vi.fn().mockRejectedValueOnce(new Error("Revision conflict: this spec changed" )).mockResolvedValue({ revision: 2, updatedAt: current.spec.updatedAt });
+    const view = renderSlot({ component: Workspace }, { ...workspaceProps, selectedSlug: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current, specs_save: save,
+    } });
+    fireEvent.click(await view.findByRole("button", { name: "Edit source" }));
+    fireEvent.change(view.getByLabelText("Mermaid source"), { target: { value: "flowchart TD\n A --> C" } });
+    fireEvent.click(view.getByRole("button", { name: "Save diagram" }));
+    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("Revision conflict"), { timeout: 2500 });
+    fireEvent.click(view.getByRole("button", { name: "Edit source" }));
+    expect((view.getByLabelText("Mermaid source") as HTMLTextAreaElement).value).toBe("flowchart TD\n A --> C");
+    expect(save).toHaveBeenCalledWith({ id: current.spec.id, expectedRevision: 1, title: current.spec.title, summary: "", content: "Before\n\n```mermaid\nflowchart TD\n A --> C\n```\n\nAfter" });
+  });
+  it("attaches diagram source to a chat draft without sending before the user finishes it", async () => {
+    const current = detail("Diagram chat");
+    current.spec.content = "```mermaid\nsequenceDiagram\n A->>B: Request\n```";
+    const ask = vi.fn(() => ({ threadId: "diagram-chat", created: true }));
+    const view = renderSlot({ component: Workspace }, { ...workspaceProps, selectedSlug: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current, chat_ask: ask,
+    } });
+    fireEvent.click(await view.findByRole("button", { name: "Discuss diagram" }));
+    const input = view.getByPlaceholderText("Discuss this spec or ask for a change…") as HTMLTextAreaElement;
+    expect(input.value).toContain("refine this diagram in this spec");
+    expect(input.value).toContain("sequenceDiagram\n A->>B: Request");
+    expect(ask).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: input.value + "Add the response" } });
+    fireEvent.click(view.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(ask).toHaveBeenCalledWith({ specId: current.spec.id, text: expect.stringContaining("Add the response") }));
+  });
+});
+
+
+describe("inline drafting from the workspace", () => {
+  it.each(["success", "save failure", "send failure"])("preserves the cursor and request through %s", async (outcome) => {
+    vi.stubGlobal("ResizeObserver", class { observe() {} unobserve() {} disconnect() {} });
+    Range.prototype.getBoundingClientRect = () => new DOMRect(10, 10, 100, 20);
+    Range.prototype.getClientRects = () => [new DOMRect(10, 10, 100, 20)] as unknown as DOMRectList;
+    let current = detail("Inline draft");
+    current.spec.content = "Before";
+    const dispatch = vi.fn(() => {
+      if (outcome === "send failure") throw new Error("Agent unavailable");
+      current = { ...current, chatThreadId: "inline-chat" };
+      return { ok: true, threadId: "inline-chat" };
+    });
+    const save = vi.fn((raw: unknown) => {
+      if (outcome === "save failure") throw new Error("Save unavailable");
+      const input = raw as { content: string; expectedRevision: number };
+      current = { ...current, spec: { ...current.spec, content: input.content, revision: input.expectedRevision + 1 } };
+      return { revision: current.spec.revision, updatedAt: current.spec.updatedAt };
+    });
+    const view = renderSlot({ component: Workspace }, { ...workspaceProps, selectedSlug: current.spec.id }, { rpc: {
+      specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current,
+      specs_save: save, chat_draft: dispatch,
+    } });
+    await view.findByLabelText("Spec content");
+    const editor = getNearestEditorFromDOMNode(view.getByLabelText("Spec content"))!;
+    await act(async () => { editor.update(() => { $getRoot().getAllTextNodes()[0]!.selectEnd().insertText(" @agent"); }, { discrete: true }); });
+    fireEvent.click(await view.findByRole("option", { name: "@ Agent · Draft here" }));
+    fireEvent.change(await view.findByLabelText("What should the agent draft?"), { target: { value: "Draft the acceptance criteria" } });
+    fireEvent.click(view.getByRole("button", { name: "Draft" }));
+    if (outcome === "save failure") {
+      await view.findByText("Save your document changes before asking the agent. Your request is still here.");
+      expect(dispatch).not.toHaveBeenCalled();
+    } else {
+      await waitFor(() => expect(dispatch).toHaveBeenCalledWith({ specId: current.spec.id, text: "Draft the acceptance criteria", expectedRevision: 2, insertionOffset: 7 }));
+      expect(current.spec.content).toBe("Before ");
+      if (outcome === "success") {
+        await waitFor(() => expect(view.getByLabelText("Spec content")).toBeTruthy());
+        expect(view.getByPlaceholderText("Discuss this spec or ask for a change…")).toBeTruthy();
+      } else await view.findByText("Agent unavailable");
+    }
+    if (outcome !== "success") expect((view.getByLabelText("What should the agent draft?") as HTMLTextAreaElement).value).toBe("Draft the acceptance criteria");
+  });
+});
+
+it("opens ready to type, autosaves without Done, and never rewrites on initial load", async () => {
+  const current = detail("Always editable");
+  current.spec.content = "Before\n\n```mermaid\nflowchart LR\n A --> B\n```\n\nAfter";
+  const save = vi.fn(() => ({ revision: 2, updatedAt: current.spec.updatedAt }));
+  const view = renderSlot({ component: Workspace }, { ...workspaceProps, selectedSlug: current.spec.id }, { rpc: {
+    specs_list: () => ({ specs: [current.spec], projects: [] }), specs_get: () => current, specs_save: save,
+  } });
+  const root = await view.findByLabelText("Spec content");
+  expect(root.getAttribute("contenteditable")).toBe("true");
+  expect(view.queryByRole("button", { name: "Edit" })).toBeNull();
+  expect(view.queryByRole("button", { name: "Done" })).toBeNull();
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 1300)); });
+  expect(save).not.toHaveBeenCalled();
+  const editor = getNearestEditorFromDOMNode(root)!;
+  await act(async () => { editor.update(() => { $getRoot().getFirstChildOrThrow().selectEnd().insertText(" plus typing"); }, { discrete: true }); });
+  await waitFor(() => expect(save).toHaveBeenCalledWith(expect.objectContaining({ content: expect.stringContaining("Before plus typing"), expectedRevision: 1 })), { timeout: 2500 });
 });

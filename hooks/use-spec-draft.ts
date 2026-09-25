@@ -9,7 +9,6 @@ type Session = {
   revision: number;
   baseline: Fields;
   values: Fields;
-  editing: boolean;
   error: string | null;
   conflict: boolean;
   storageError: boolean;
@@ -52,7 +51,7 @@ function openSession(spec: DraftSpec, key: string): Session {
   if (cached !== undefined) return cached;
   const session: Session = {
     id: spec.id, key, revision: spec.revision, baseline: fields(spec),
-    values: fields(spec), editing: false, error: null, conflict: false,
+    values: fields(spec), error: null, conflict: false,
     storageError: false, editorVersion: 0, recoveredPending: false,
     state: "idle", pending: null, remote: null, listeners: new Set(),
   };
@@ -71,7 +70,6 @@ function openSession(spec: DraftSpec, key: string): Session {
         session.baseline = saved.baseline;
         session.values = saved.values;
         session.recoveredPending = saved.pending === true;
-        session.editing = true;
       }
     }
   } catch {
@@ -217,10 +215,10 @@ export function useSpecDraft(
   const values = session?.values ?? (spec === null ? { title: "", summary: "", content: "" } : fields(spec));
   const dirty = session !== null && isDirty(session);
   useEffect(() => {
-    if (session === null || !session.editing || !dirty || session.error !== null) return;
+    if (session === null || !dirty || session.error !== null) return;
     const timer = setTimeout(() => void flush(session), 1200);
     return () => clearTimeout(timer);
-  }, [session, values, dirty, session?.editing, session?.error, flush]);
+  }, [session, values, dirty, session?.error, flush]);
 
   const update = (patch: Partial<Fields>) => {
     if (session === null) return;
@@ -234,30 +232,20 @@ export function useSpecDraft(
   return {
     values,
     dirty,
-    editing: session?.editing ?? false,
     saveState: session?.state ?? "idle",
     saveError: session?.error ?? null,
     conflict: session?.conflict ?? false,
     storageError: session?.storageError ?? false,
     editorVersion: session?.editorVersion ?? 0,
     update,
-    beginEdit() {
-      if (active.current !== null) { active.current.editing = true; notify(); }
-    },
     async save() { return session === null || await flush(session, true); },
-    async finishEdit() {
-      if (session === null || !await flush(session, true)) return false;
-      session.editing = false;
-      notify(session);
-      return true;
-    },
     discard() {
       if (session === null || spec === null || session.pending !== null) return;
       session.revision = spec.revision;
       session.baseline = fields(spec);
       session.values = fields(spec);
       session.recoveredPending = false;
-      session.editing = false;
+      session.editorVersion += 1;
       session.error = null;
       session.conflict = false;
       session.state = "idle";
